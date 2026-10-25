@@ -16,6 +16,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import time
@@ -35,6 +36,9 @@ def adb(*args, check=True):
 
 
 def start_phone(a):
+    # 화면이 꺼져 있거나 잠겨 있으면 앱이 화면 뒤에서 시작돼 Android 가 카메라를 막는다 ("cannot open camera from background")
+    adb("shell", "input", "keyevent", "KEYCODE_WAKEUP", check=False)
+    adb("shell", "wm", "dismiss-keyguard", check=False)      # 패턴·PIN 잠금은 못 푼다 — 그때는 아래 오류 안내
     adb("shell", "am", "force-stop", PACKAGE)
     adb("shell", "run-as", PACKAGE, "rm", "-f", "files/status.txt", "files/cameras.json")
     args = ["shell", "am", "start", "-S", "-n", PACKAGE + "/.MainActivity"]
@@ -86,7 +90,8 @@ def run_offline(bundle, depth_worker, a):
         if (img.shape[1], img.shape[0]) != tuple(a.size):
             raise ValueError(f"{bundle}: 이미지 {img.shape[1]}x{img.shape[0]} 가 --size {a.size} 와 다름")
         pair.append(PhoneFrame(index=i, timestamp_ns=int(ts[indices[i]] if indices[i] < len(ts) else 0), bgr=img))
-    depth_worker.ep = None            # 라이브는 첫 쌍에서 한 번만 검사하지만, 번들마다 다른 장면이므로 매번 다시
+    # 번들마다 다른 장면이라 매번 다시, 쌍이 하나뿐이므로 그 한 쌍으로 판정 (라이브는 질감 있는 쌍 3개 중앙값)
+    depth_worker.ep, depth_worker.ep_samples, depth_worker.ep_need = None, [], 1
     vis, report = depth_worker(pair, imu)
     cv2.imwrite(str(bundle / f"depth_{a.yolo}.png"), vis)
     (bundle / "depth.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
@@ -123,6 +128,8 @@ def main(a):
         raise ValueError("Need positive even image dimensions and nonnegative skew limit")
     if a.duration < 0 or a.fps <= 0 or not 0 < a.scale <= 1 or a.iters < 1:
         raise ValueError("Invalid duration/fps/scale/iters")
+    if a.show_board and (a.headless or not a.board_hud or not a.save_interval):
+        raise ValueError("--show-board 는 --board-hud --save-interval 과 함께, --headless 없이")
     if a.rgbd_viewer and (not a.calib_stereo or a.raw_ts):
         raise ValueError("--rgbd-viewer requires --calib-stereo and physical timestamps")
     if a.rgbd_viewer and (not np.isfinite(a.depth_range).all() or not 0 < a.depth_range[0] < a.depth_range[1]):
@@ -162,6 +169,8 @@ def main(a):
             if r.returncode == 0:
                 inventory = json.loads(r.stdout)
                 (out / "cameras.json").write_text(json.dumps(inventory, indent=2))
+                # z_phone_calib 기본 --inventory(lib_phone_calib.DEFAULT_INVENTORY) 가 읽는 위치. 없으면 S24 사본으로 조용히 넘어간다
+                (ROOT / "phone_stereo/runs/cameras.json").write_text(json.dumps(inventory, indent=2))
                 for c in inventory:
                     print(f"logical {c['id']} facing={c['facing']}: "
                           + ", ".join(f"physical {p['id']} focal={p.get('focal_mm')}mm" for p in c['physical']))
@@ -179,6 +188,9 @@ def main(a):
         if state.startswith("STREAMING"):
             sock = socket.create_connection(("127.0.0.1", 8765), timeout=8)
             break
+        if "from background" in state:
+            raise RuntimeError("폰 화면이 꺼져 있거나 잠겨 있어 앱이 카메라를 열지 못했다. 폰 화면을 켜고 잠금을 푼 뒤 다시 실행할 것 "
+                               "(USB 연결 중 화면 유지: adb shell settings put global stay_on_while_plugged_in 2)\n" + state)
         if any(s in state for s in ("FAILED", "ERROR", "DISCONNECTED", "STOPPED")):
             raise RuntimeError(state)
         time.sleep(.15)
@@ -204,6 +216,15 @@ def main(a):
     gate_reason, gate_color, last_saved_at, last_printed = "", (0, 220, 255), 0, ""   # 왜 저장하는지/안 하는지 HUD+터미널
     if a.board_hud:
         import lib_calib
+    # --show-board: 이 PC 화면에 보드를 전체화면으로 띄우고, 저장 상태를 보드 바깥 여백(테두리 색 + 아래 글자)에 그린다.
+    # 보드가 화면을 덮어 촬영 창을 볼 수 없을 때 폰을 든 사람이 화면만 보고 정지/저장을 알 수 있게 한다.
+    board_img, board_checked = None, False
+    if a.show_board:
+        board_img = cv2.imread(a.show_board)
+        if board_img is None:
+            raise FileNotFoundError(a.show_board)
+        cv2.namedWindow("board", cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty("board", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     def small(f):
         return cv2.resize(cv2.cvtColor(f.bgr, cv2.COLOR_BGR2GRAY), (160, 120), interpolation=cv2.INTER_AREA).astype(np.float32)
     title = "Phone Stereo - USB to PC (Q: quit, S: paired PNG)"
@@ -253,7 +274,31 @@ def main(a):
                             cv2.putText(img, gate_reason[:70], (12, img.shape[0] - 14), cv2.FONT_HERSHEY_SIMPLEX, .7, gate_color, 2)
                     tiles.append(img)
                 canvas = np.hstack(tiles)
-                if rgbd_viewer is None:
+                if board_img is not None:
+                    n_saved = len(list((out / "captures").iterdir())) if (out / "captures").exists() else 0
+                    vis = board_img.copy()
+                    H, W = vis.shape[:2]
+                    cv2.rectangle(vis, (0, 0), (W - 1, H - 1), gate_color, 30)       # 보드와 60px 넘게 떨어진 화면 가장자리
+                    # 뷰파인더: 두 렌즈 화면(코너 표시 포함)을 아래 여백 양끝에 작게 — 보드가 두 렌즈에 다 들어왔는지 보며 거리를 맞춘다
+                    th = 130
+                    for k, tile in enumerate(tiles[:2]):
+                        t = cv2.resize(tile, (int(tile.shape[1] * th / tile.shape[0]), th), interpolation=cv2.INTER_AREA)
+                        x0 = 40 if k == 0 else W - 40 - t.shape[1]
+                        vis[H - th - 18:H - 18, x0:x0 + t.shape[1]] = t
+                    cv2.putText(vis, f"saved {n_saved}  |  {gate_reason[:42] or 'START'}", (260, H - 70),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 3)
+                    cv2.imshow("board", vis)
+                    if not board_checked:
+                        # 화면과 그림 크기가 같아야 1:1 (늘어나면 칸 실치수가 --ruler-mm 계산과 달라진다).
+                        # 창을 그리기 전에 준 전체화면 요청은 가끔 무시된다(실측 400x225) → 맞을 때까지 다시 요청, 5초 안에 안 되면 중단
+                        if tuple(cv2.getWindowImageRect("board")[2:]) == (W, H):
+                            board_checked = True
+                        elif now - started > 5:
+                            raise RuntimeError(f"보드가 1:1 로 표시되지 않음: 창 {cv2.getWindowImageRect('board')[2:]} vs 그림 {(W, H)} "
+                                               "— 화면 해상도와 같은 크기의 타겟을 쓸 것")
+                        else:
+                            cv2.setWindowProperty("board", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                elif rgbd_viewer is None:
                     cv2.imshow(title, canvas)
                 if result is not None and rgbd_viewer is None:
                     cv2.imshow("PC inference - sampled frame (not raw live feed)", result)
@@ -273,6 +318,8 @@ def main(a):
             if a.save_interval and pair and pair[0].timestamp_ns != last_pair_ts:
                 last_pair_ts = pair[0].timestamp_ns
                 ok_to_save, reasons = True, []                                     # reasons: 저장 안 되는 이유 (HUD·터미널)
+                if board_img is not None and not board_checked:
+                    ok_to_save = False; reasons.append("BOARD WINDOW NOT 1:1 YET")
                 if a.board_hud:
                     # 절반 해상도 빠른 검출 (HUD·게이트용). 실제 캘리는 z_phone_calib 가 저장 PNG 에서 풀해상도로 다시 검출한다.
                     board_corners = [lib_calib.find_corners(cv2.cvtColor(f.bgr, cv2.COLOR_BGR2GRAY), fast=True) for f in pair[:2]]
@@ -304,7 +351,7 @@ def main(a):
                 elif now - last_saved_at > 1.0:                                     # 저장 직후 1초는 SAVED 표시 유지
                     gate_reason = " | ".join(reasons) or "READY"
                     gate_color = (0, 220, 255) if reasons and reasons[0].startswith("WAIT") else (0, 0, 255)
-                key_reason = gate_reason.split(" (")[0].split(" hold")[0]
+                key_reason = re.sub(r"[\d.]+", "#", gate_reason.split(" (")[0].split(" hold")[0])   # 숫자(남은 초 등)만 바뀌면 같은 이유
                 if key_reason != last_printed:                                       # 이유가 바뀔 때만 터미널에 (스팸 방지)
                     print(f"[save gate] {gate_reason}", flush=True); last_printed = key_reason
             if now - last_print >= 5:
@@ -373,6 +420,7 @@ if __name__ == "__main__":
     ap.add_argument("--still", action="store_true", help="--save-interval 저장을 '정지 순간'(연속 프레임 차이·자이로 작음, 지난 저장과 다른 장면)으로 제한")
     ap.add_argument("--still-thr", type=float, default=1.5, help="정지 판정 프레임 차이 임계 (160x120 회색 평균 절대차)")
     ap.add_argument("--board-hud", action="store_true", help="체커보드 검출 표시(BOARD OK/NO BOARD, 코너) + 양쪽 다 검출될 때만 저장")
+    ap.add_argument("--show-board", metavar="PNG", help="이 PC 화면에 보드 PNG 를 1:1 전체화면으로 띄우고 저장 상태를 여백에 표시 (--board-hud 와 함께, 화면 해상도와 같은 크기의 PNG)")
     args = ap.parse_args()
     try:
         main(args)

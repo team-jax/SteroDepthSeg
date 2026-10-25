@@ -105,7 +105,8 @@ with tempfile.TemporaryDirectory() as td:
     args = SimpleNamespace(calib_l=str(cp), calib_r=str(cp), calib_stereo=str(sp), left=str(root / 'L.png'), right=str(root / 'R.png'), out=str(root / 'out'),
                            ckpt='stub', iters=8, scale=1., z_range=(.1, 20.), mode='both', model=None, conf=.25, classes=None, device='cpu', known_m=None, known_idx=1,
                            pose='stereo', lr_check=False, lr_thr_px=1.5)
-    unavailable = dict(status='unavailable', n=0, dy_med=None, dy_rms=None, pos_dx_frac=None)
+    unavailable = lr.epipolar_check(img, img)    # 검은 영상 -> 실제 함수의 'unavailable' 반환 (손으로 베낀 dict 는 키가 빠져 KeyError 를 냈다)
+    assert unavailable['status'] == 'unavailable'
     try:
         with patch.object(lr, 'epipolar_check', return_value=unavailable), patch.object(zd.lib_ffs, 'load', return_value=None), \
              patch.object(zd.lib_ffs, 'infer', return_value=np.full((480, 640), 40, np.float32)), patch.object(ld, 'detect_yolo', return_value=[]), contextlib.redirect_stdout(io.StringIO()):

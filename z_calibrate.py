@@ -10,7 +10,7 @@ z_calibrate.py — 웹캠 내부 파라미터 캘리브레이션 실행 스크�
   2) python z_calibrate.py --capture
        라이브 창을 보며 폰을 움직인다. HUD의 sharp/FOUND/size%를 보고
        "선명하면서 보드가 크게 잡히는" 거리를 먼저 찾은 뒤 SPACE로 15~20장.
-  3) python z_calibrate.py --run --ruler-mm 97.5
+  3) python z_calibrate.py --run --ruler-mm 122.0     # 1) 에서 잰 값 (s24 타겟 ≈ 121.5~122.2)
        calib.json 생성 + 게이트 수치 출력.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

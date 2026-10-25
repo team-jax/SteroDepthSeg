@@ -103,6 +103,8 @@
     "n": 0,
     "dy_med": null,
     "dy_rms": null,
+    "dy_rms_inlier": null,
+    "inlier_frac": null,
     "pos_dx_frac": null
   }
 }

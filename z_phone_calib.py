@@ -24,6 +24,7 @@ import lib_phone_calib as pc
 
 EPI_GATE_PX, EPI_INLIER_FRAC = 1.0, 0.7          # z_object_depth.py 와 같은 합격선 (torch 임포트를 피하려 여기에 복제)
 BOARD_RMS_MAX_PX, BOARD_MIN_VIEWS, BOARD_BASELINE_TOL = 1.0, 8, 0.15
+BOARD_FOCAL_SCALE_TOL = 0.05     # K 고정 보드 캘리를 허용하는 refine 광각 fx 스케일 편차 (S24 0.009 / S25 0.18)
 
 
 def scale_to(st, size):
@@ -74,6 +75,11 @@ def main(a):
         base = scale_to(pc.load(a.base), a.size)
         if base["phone"]["physical"] != [L, R]:
             raise ValueError(f"--base {a.base} 는 {base['phone']['physical']} 용 — --physical 불일치")
+        # 물리 id 는 기종이 달라도 같다(S24·S25 모두 2,5). 공장 baseline 이 다르면 다른 폰의 보정본이다
+        fb = base.get("factory_baseline_m")
+        if fb is None or abs(fb / st["factory_baseline_m"] - 1) > 0.01:
+            raise ValueError(f"--base {a.base} 의 공장 baseline {fb} m 가 이 폰 인벤토리 {st['factory_baseline_m']:.5f} m 와 다름 "
+                             f"— 다른 폰의 보정본. --base 없이 하거나 이 폰으로 만든 --refine 결과를 줄 것")
         for k in ("K1", "K2", "dist1", "dist2", "R", "T", "focal_scale_wide"):
             if k in base:
                 st[k] = base[k]
@@ -93,7 +99,7 @@ def main(a):
         st.update(R=Rn, T=Tn, pose_source="factory_baseline + scene_refined(roll,pitch,wide_scale)",
                   scale_status="factory_baseline_refined",
                   refine=dict(info, fit_t=bool(a.fit_t), pairs=[p[0] for p in pairs], counts=counts),
-                  warnings=["baseline 15.76mm 는 공장값 그대로 (검증 안 됨)",
+                  warnings=[f"baseline {st['factory_baseline_m']*1000:.2f}mm 는 공장값 그대로 (검증 안 됨)",
                             "yaw 는 공장값 그대로 (dy 로 관측 불가) -> 깊이 편향 가능. --known (실측 거리 1개) 또는 --board 로 고정",
                             "정류 dy 만 개선된 상태"])
         print(f"회전 보정 (x,y,z)={info['delta_rot_deg_xyz']}°  광각 fx 스케일 {s_wide:.4f}  T 방향 보정 {info['delta_t_dir_deg']:.3f}°  "
@@ -113,7 +119,7 @@ def main(a):
         st, info = pc.pin_yaw_known_distance(st, imL, imR, a.roi, a.known_m)
         st["pose_source"] = st["pose_source"] + " + yaw_pinned(known_distance)"
         st["scale_status"] = "known_distance_pinned"
-        st["warnings"] = ["baseline 15.76mm 는 공장값 그대로", f"yaw 를 실측 {a.known_m}m 물체 하나로 고정 — 다른 거리 1개로 교차 확인 권장"]
+        st["warnings"] = [f"baseline {st['baseline_m']*1000:.2f}mm 는 공장값 그대로", f"yaw 를 실측 {a.known_m}m 물체 하나로 고정 — 다른 거리 1개로 교차 확인 권장"]
         print(f"yaw 고정: ROI 시차 {info['disparity_before_px']:.2f}px (깊이 {info['depth_before_m']}m) -> {info['disparity_after_px']:.2f}px "
               f"(목표 {info['target_px']:.2f}px = {a.known_m}m), yaw 보정 {info['yaw_delta_deg']:+.3f}°, 대응점 {info['n_matches']}")
     if a.board:
@@ -136,6 +142,10 @@ def main(a):
         if b["rms_px"] > BOARD_RMS_MAX_PX: reasons.append(f"rms {b['rms_px']:.2f}px > {BOARD_RMS_MAX_PX}")
         if b["n_views"] < BOARD_MIN_VIEWS: reasons.append(f"뷰 {b['n_views']} < {BOARD_MIN_VIEWS}")
         if abs(ratio - 1) > BOARD_BASELINE_TOL: reasons.append(f"baseline 이 공장값과 {abs(ratio-1)*100:.0f}% 차이")
+        # refine 이 광각 fx 를 크게 바꿨다 = 공장 K 가 스트림과 안 맞음(S25: 0.82). K 를 고정하면 RMS<1px 로 통과해도 거리가 15% 틀렸다
+        fs = float(st.get("focal_scale_wide", 1.0))
+        if not a.free_intrinsics and abs(fs - 1) > BOARD_FOCAL_SCALE_TOL:
+            reasons.append(f"광각 fx 스케일 {fs:.3f} (공장 K 가 영상과 {abs(fs-1)*100:.0f}% 어긋남) — K 고정은 거리가 틀린다. --free-intrinsics 로 다시")
         st["scale_status"] = "metric" if not reasons else "board_unreliable"
         st["warnings"] = reasons or ["체커보드 stereoCalibrate 통과 — 실측 거리 1개로 최종 확인 권장"]
         rows, _ = pc.evaluate_pairs(pairs, st)

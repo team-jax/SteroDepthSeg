@@ -99,6 +99,18 @@ def skew_rotation(st, imu):
     return Rg, float(np.degrees(np.arccos(np.clip((np.trace(Rg) - 1) / 2, -1, 1))))
 
 
+def motion_px(imu, f_px):
+    """노출 + 롤링셔터 읽기 동안 폰 회전으로 상이 움직인 양(px) = |ω|·(노출 + 롤링셔터 skew)·f. 센서 없으면 None.
+
+    frame_timing 값 = [물리별 오프셋 ms…, 노출 ms, 프레임 주기 ms, 롤링셔터 skew ms] (lib_phone_stereo.SENSOR_FRAME_TIMING).
+    """
+    g, ft = (imu or {}).get("gyroscope"), (imu or {}).get("frame_timing")
+    if not g or not ft or len(ft["values"]) < 3:
+        return None
+    w = float(np.linalg.norm(np.asarray(g["values"][:3], float)))
+    return w * (float(ft["values"][-3]) + float(ft["values"][-1])) * 1e-3 * f_px
+
+
 class PhoneDepth:
     def __init__(self, a):
         import lib_rectify as lr
@@ -113,8 +125,41 @@ class PhoneDepth:
         if st.get("focus_m") is not None and abs(float(st["focus_m"]) - float(getattr(a, "focus_m", st["focus_m"]))) > 1e-6:
             self.focus_warning = f"focus_mismatch:calib {st['focus_m']}m vs run {a.focus_m}m"
         self.model = None
-        self.ep = None
+        self.ep, self.ep_samples, self.ep_need = None, [], 3      # 정류 판정: 질감 있는 쌍 3개 중앙값 (check_rectification)
         self.rgbd_snapshot = None
+
+    def check_rectification(self, left, right, motion_px=None):
+        """정류 dy 검사. 질감 있는 쌍 ep_need 개의 중앙값으로 한 번 판정하고, 판정 후에는 다시 보지 않는다.
+
+        - 질감 없는 쌍(unavailable)은 세지 않는다: 첫 쌍만 보던 때는 첫 쌍이 단색이면 검사가 영영 안 돌아
+          다른 폰의 캘리(dy 27px)로도 depth 를 계속 냈다.
+        - 한 쌍으로 판정하지 않는다: 손에 든 폰의 첫 쌍이 살짝 흔들려 dy 1.06px 로 라이브 전체가 멈췄다
+          (같은 실행의 마지막 쌍은 0.74px, 정지 장면 0.25~0.55px). 틀린 캘리는 모든 쌍이 크게 넘으므로 중앙값으로도 잡힌다.
+        - 움직이는 쌍은 세지 않는다: motion_px(노출+롤링셔터 동안 회전에 의한 상 이동, px)가 합격선(EPI_GATE_PX) 이상이면
+          그 쌍의 dy 는 캘리가 아니라 흔들림을 잰다 (실측: 폰을 3.3 rad/s 로 돌리던 쌍 dy 4.77/2.59px 로 라이브가 멈췄다).
+        판정 전에는 status="pending" (객체에 rectification_unverified 경고).
+        """
+        if self.ep is not None and self.ep["status"] == "ok":
+            return
+        import lib_rectify as lr
+        import z_object_depth as od
+        if motion_px is not None and motion_px >= od.EPI_GATE_PX:
+            self.ep = self.ep or dict(status="unavailable", reason="moving")
+            return
+        ep = lr.epipolar_check(left, right)
+        if ep["status"] != "ok":
+            self.ep = self.ep or ep
+            return
+        self.ep_samples.append(ep)
+        if len(self.ep_samples) < self.ep_need:
+            self.ep = dict(ep, status="pending", n_pairs=len(self.ep_samples))
+            return
+        dy = float(np.median([e["dy_med"] for e in self.ep_samples]))
+        inl = float(np.median([e["inlier_frac"] for e in self.ep_samples]))
+        self.ep = dict(ep, dy_med=dy, inlier_frac=inl, n_pairs=len(self.ep_samples),
+                       dy_med_pairs=[round(e["dy_med"], 3) for e in self.ep_samples])
+        if dy >= od.EPI_GATE_PX or inl < od.EPI_INLIER_FRAC:
+            raise ValueError(f"Phone rectification failed: {self.ep}")
 
     def __call__(self, pair, imu=None):
         import lib_ffs
@@ -141,10 +186,7 @@ class PhoneDepth:
             rp = self.rp0
         self.rp = rp
         left, right = lr.rectify_pair(fL.bgr, fR.bgr, rp)
-        if self.ep is None:
-            self.ep = lr.epipolar_check(left, right)
-            if self.ep["status"] == "ok" and (self.ep["dy_med"] >= od.EPI_GATE_PX or self.ep["inlier_frac"] < od.EPI_INLIER_FRAC):
-                raise ValueError(f"Phone rectification failed: {self.ep}")
+        self.check_rectification(left, right, motion_px(imu, rp["f"]))
         if self.model is None:
             self.model = lib_ffs.load(valid_iters=a.iters)
         disp = lib_ffs.infer(self.model, cv2.cvtColor(left, cv2.COLOR_BGR2RGB),
@@ -191,7 +233,7 @@ class PhoneDepth:
         zr = getattr(a, "depth_range", None) or (0.3, 3.0)
         overlays.append(depth_colormap(depth, valid, float(zr[0]), float(zr[1])))
         report = dict(timestamp_ns=[fL.timestamp_ns, fR.timestamp_ns], physical_lr=self.st["phone"]["physical"],
-                      exposure_skew_ms=(fR.timestamp_ns - fL.timestamp_ns) / 1e6, gyro_skew_compensation_deg=round(skew_deg, 4),
+                      exposure_skew_ms=(fR.timestamp_ns - fL.timestamp_ns) / 1e6, gyro_skew_compensation_deg=round(skew_deg, 4), motion_px=motion_px(imu, rp["f"]),
                       mode=mode, device="cuda:0",
                       imu={k: v for k, v in (gf or {}).items() if k != "R_cam1_to_world"} if gf else dict(available=False),
                       imu_raw={k: v for k, v in (imu or {}).items() if k != "gravity"},

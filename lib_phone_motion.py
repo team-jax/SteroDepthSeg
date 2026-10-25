@@ -48,13 +48,18 @@ def relative_rotation_cam(st, imuA, imuB, key=ROTVEC_KEY):
 
 def gyro_integrated_rotation(gyro_samples, tA_ns, tB_ns):
     """원시 자이로(rad/s, 기기 프레임) 를 tA..tB 사이 적분한 회전 (기기 프레임, X_devB = R X_devA). 회전벡터와의 교차검증용."""
-    s = [(t, np.asarray(v[:3], float)) for t, v in gyro_samples if tA_ns <= t <= tB_ns]
-    if len(s) < 2:
-        return None
-    R = np.eye(3)
+    # 표본 구간마다 [tA,tB] 와 겹치는 부분만 적분한다. 예전엔 tA..tB '안의' 표본만 써서, 두 렌즈 노출 차(~6ms)가
+    # 자이로 주기(~10ms)보다 짧으면 안에 표본이 없어 항상 None(보상 0) 이었다 — gyro_window 는 양 끝 바깥 표본을 담아 온다.
+    s = sorted((t, np.asarray(v[:3], float)) for t, v in gyro_samples)
+    R, covered = np.eye(3), 0
     for (t0, w0), (t1, w1) in zip(s[:-1], s[1:]):
-        dt = (t1 - t0) * 1e-9
-        R = cv2.Rodrigues(0.5 * (w0 + w1) * dt)[0] @ R      # 기기 프레임 각속도: 누적 R_{k+1} = exp(ω dt) R_k
+        a, b = max(t0, tA_ns), min(t1, tB_ns)
+        if b <= a:
+            continue
+        covered += b - a
+        R = cv2.Rodrigues(0.5 * (w0 + w1) * (b - a) * 1e-9)[0] @ R      # 기기 프레임 각속도: 누적 R_{k+1} = exp(ω dt) R_k
+    if covered == 0:
+        return None
     return R.T                                              # 위 R 은 A 프레임의 벡터를 B 로 보내는 것의 역 → 전치
 
 

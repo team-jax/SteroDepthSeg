@@ -148,7 +148,7 @@ def load_pairs(dirs, idL, idR):
                 raise FileNotFoundError(f"{p}: camera_{idL}.png / camera_{idR}.png 둘 다 필요")
             out.append((str(p), imL, imR))
     if not out:
-        raise FileNotFoundError(f"{dirs}: camera_{idL}.png 가 있는 번들 없음")
+        raise FileNotFoundError(f"{dirs}: camera_{idL}.png 가 있는 번들 없음 — 촬영 명령(z_phone_stereo.py)이 오류로 끝나지 않았는지, 폴더 경로가 맞는지 확인")
     return out
 
 
@@ -313,7 +313,10 @@ def board_stereo_calibrate(pairs, st, square_m, pattern=lib_calib.PATTERN, fix_i
     """두 렌즈가 동시에 본 체커보드 번들들로 R, T (옵션: K, dist 도) 를 추정.
 
     fix_intrinsics=True : 공장 K/dist 고정 (CALIB_FIX_INTRINSIC) — 뷰가 적어도 안정적
-    False               : 공장값을 초기값으로 K/dist 까지 재추정 (뷰 20장 이상 권장)
+    False               : 두 렌즈 K/dist 를 각각 보드만으로 calibrateCamera 한 뒤 고정하고 R,T 만 푼다 (뷰 20장 이상 권장).
+                          공장/refine K 를 초기값으로 한 공동 추정(USE_INTRINSIC_GUESS)은 S25 실데이터에서 틀린 해로 갔다
+                          (fx L 258·R 349, baseline 19.75mm, RMS 0.35) — 렌즈별 단독 캘리는 fx 312·424, 뷰별 baseline 16.15mm.
+                          z_calibrate.py --run-stereo 와 같은 순서.
     반환 st 갱신본 + 진단(rms, per_view, n_views, used, baseline 비교).
     """
     objp = lib_calib.object_points(pattern, square_m)
@@ -327,6 +330,12 @@ def board_stereo_calibrate(pairs, st, square_m, pattern=lib_calib.PATTERN, fix_i
         obj.append(objp); cL_list.append(cL.astype(np.float32)); cR_list.append(cR.astype(np.float32)); used.append(name)
     size = tuple(st["image_size"])
     K1, d1, K2, d2 = (np.asarray(st[k], np.float64).copy() for k in ("K1", "dist1", "K2", "dist2"))
+    if not fix_intrinsics:
+        if len(obj) < 10:
+            raise ValueError(f"렌즈별 K 추정에 보드 뷰 {len(obj)}개 — 최소 10, 권장 20+")
+        rms1, K1, d1, _, _ = cv2.calibrateCamera(obj, cL_list, size, None, None)
+        rms2, K2, d2, _, _ = cv2.calibrateCamera(obj, cR_list, size, None, None)
+        single_rms = [float(rms1), float(rms2)]
     # 동기 어긋남 거르기: 왼쪽 PnP 포즈 + 현재 (R,T) 로 오른쪽 코너를 예측한 오차. 정지 쌍은 서로 비슷하고(yaw 편향만큼 일정),
     # 움직이는 중에 찍힌 쌍은 수 px~수십 px 로 튄다 → 중앙값의 2배+1px 를 넘는 쌍은 제외 (STATUS 문제점 18).
     R0, T0 = np.asarray(st["R"], np.float64), np.asarray(st["T"], np.float64).reshape(3, 1)
@@ -342,7 +351,7 @@ def board_stereo_calibrate(pairs, st, square_m, pattern=lib_calib.PATTERN, fix_i
     obj, cL_list, cR_list, used = [obj[i] for i in keep], [cL_list[i] for i in keep], [cR_list[i] for i in keep], [used[i] for i in keep]
     if len(obj) < 5:
         raise ValueError(f"쓸 수 있는 쌍 {len(obj)}개 — 최소 5, 권장 15+. 미검출: {len(skipped)}, 동기 불일치로 제외: {len(dropped)} {dropped[:5]}")
-    flags = cv2.CALIB_FIX_INTRINSIC if fix_intrinsics else cv2.CALIB_USE_INTRINSIC_GUESS
+    flags = cv2.CALIB_FIX_INTRINSIC                      # K 는 공장/base 값(fix) 또는 위 렌즈별 단독 캘리 값
     crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 200, 1e-7)
     out = cv2.stereoCalibrateExtended(obj, cL_list, cR_list, K1, d1, K2, d2, size,
                                       np.asarray(st["R"], np.float64), np.asarray(st["T"], np.float64).reshape(3, 1),
@@ -354,7 +363,7 @@ def board_stereo_calibrate(pairs, st, square_m, pattern=lib_calib.PATTERN, fix_i
     new.update(K1=K1n, dist1=np.asarray(d1n).ravel(), K2=K2n, dist2=np.asarray(d2n).ravel(), R=R, T=T,
                baseline_m=float(np.linalg.norm(T)), pose_source="board:cv2.stereoCalibrate",
                board=dict(rms_px=float(rms), n_views=len(obj), used=used, skipped=skipped, per_view_px=per_view,
-                          sync_dropped=dropped, sync_gate_px=gate, lr_predict_err_px=[round(e, 2) for e in errs],
+                          sync_dropped=dropped, sync_gate_px=gate, single_cam_rms_px=None if fix_intrinsics else single_rms, lr_predict_err_px=[round(e, 2) for e in errs],
                           square_m=float(square_m), pattern=list(pattern), fix_intrinsics=bool(fix_intrinsics)))
     return new
 
