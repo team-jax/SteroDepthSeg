@@ -1,6 +1,6 @@
 # 스마트폰 후면 카메라 → USB → PC
 
-Galaxy S24 SM-S921N / Android 16에서 직접 확인한 구성이다. 휴대전화에 설치하는 `Phone Stereo` 앱은 Camera2의 logical camera 하나에 물리 출력 2~3개를 연결한다. PC는 ADB USB 포워딩으로 원본 YUV(NV21)를 받아 표시하고 NVIDIA GPU에서 YOLO를 실행한다.
+처음 Galaxy S24 SM-S921N / Android 16에서 만들고 확인한 구성이다. **현재 사용하는 폰은 Galaxy S25 SM-S931N** 이며, 같은 물리 렌즈 ID(2=초광각, 5=광각, 6=망원)로 2개 스트림 수신·640×480/960×720 을 확인했다(2026-10-22). 아래 표의 수치는 S24 측정값이다. 휴대전화에 설치하는 `Phone Stereo` 앱은 Camera2의 logical camera 하나에 물리 출력 2~3개를 연결한다. PC는 ADB USB 포워딩으로 원본 YUV(NV21)를 받아 표시하고 NVIDIA GPU에서 YOLO를 실행한다.
 
 ## 실행
 
@@ -49,14 +49,14 @@ USB 디버깅을 허용한 폰을 연결하고 저장소 루트에서 실행한�
   --calib-stereo calib_phone_pair.json --iters 4
 ```
 
-보정 파일 `calib_phone_pair.json` 은 `z_phone_calib.py` 가 만든다 (2026-09-22, Claude). 출처는 세 단계다.
+보정 파일 `calib_phone_pair.json` 은 `z_phone_calib.py` 가 만든다. **현재 파일은 S25 용 `metric` (2026-10-25: 보드 39뷰, RMS 0.105 px, baseline 16.64 mm, FFS vs 보드 PnP 거리 +0.8%)** 이다. 절차와 결과: [doc_CALIBRATION.md](../doc_CALIBRATION.md). 출처 단계는 다음과 같다.
 
 | 단계 | 명령 | `scale_status` | 의미 |
 |---|---|---|---|
 | 공장값 | `./venv/bin/python z_phone_calib.py --factory` | `factory_unverified` | Camera2 공장 포즈 그대로. 실쌍에서 정류 dy 2~5px → 쓰지 말 것 |
 | 회전 보정 | `./venv/bin/python z_phone_calib.py --refine phone_stereo/runs/<번들…>` | `factory_baseline_refined` | 장면 SIFT 대응점으로 roll/pitch + 광각 fx 스케일 보정(yaw 공장 고정). dy 는 맞지만 yaw 편향으로 거리가 11 % 짧았다 |
 | 실측 1개 | `./venv/bin/python z_phone_calib.py --known <번들> --known-m <m> --roi x y w h` | `known_distance_pinned` | 거리를 아는 물체의 ROI 시차로 yaw 고정. 보드 없을 때 대안 |
-| 체커보드 | `./venv/bin/python z_phone_calib.py --board phone_stereo/runs/<보드 번들> --screen laptop --ruler-mm <실측> --size 960 720 --target-size 640 480 --base calib_phone_pair.json` | `metric` (rms≤1px, 뷰≥8, baseline 공장값 ±15%) | **현재 저장소 파일**: RMS 0.26 px, 25뷰, baseline 15.53 mm. 보드 PnP 거리 대비 FFS 오차 −1.8 %(0.34~0.45 m). 촬영은 `--still --board-hud` 로 |
+| 체커보드 | `./venv/bin/python z_phone_calib.py --board phone_stereo/runs/<보드 번들> --screen laptop --ruler-mm <실측> --size 960 720 --target-size 640 480 --base <이 폰의 refine 결과> --free-intrinsics` | `metric` (rms≤1px, 뷰≥8, baseline 공장값 ±15%; refine 광각 스케일이 1에서 5% 넘게 벗어났는데 `--free-intrinsics` 가 없으면 거부) | S25: 렌즈별 단독 캘리(fx 312/424) 후 R·T, RMS 0.105 px, 39뷰, baseline 16.64 mm. S24(2026-09-22): RMS 0.26 px, baseline 15.53 mm, FFS 오차 −1.8 %. 촬영은 `--still --board-hud` (+ PC 화면에 띄울 땐 `--show-board`) |
 
 **초점은 고정해야 한다.** 광각 5 는 AF 렌즈라 자동초점이면 초점거리가 프레임마다 0.3~0.7% 변해 정류가 1~2px 씩 흔들린다. 앱은 기본으로 `CONTROL_AF_MODE_OFF` + `LENS_FOCUS_DISTANCE` 1 m 로 고정하며(`--focus-m`, 0 이면 자동초점), 캘리 번들의 초점값이 json 에 기록되고 실행값과 다르면 객체마다 `focus_mismatch` 경고가 붙는다. 초광각 2 는 고정초점이다.
 
@@ -70,7 +70,7 @@ USB 디버깅을 허용한 폰을 연결하고 저장소 루트에서 실행한�
 ./venv_ffs/bin/python z_phone_stereo.py --physical 2 5 --calib-stereo calib_phone_pair.json --yolo both
 ```
 
-직접 확인 (RTX 4060, venv_ffs, 640×480, 초점 1 m 고정): 오프라인 — 사람 seg 0.395/0.412 m (bbox 는 사람이 화면 대부분이라 배경 혼입 → seg 를 볼 것). 라이브 25초 — 367쌍 15.0 fps, FFS+YOLO(seg+bbox) 80회, 중앙값 258 ms, 첫 쌍 dy 0.32px·인라이어 0.95, 벽시계 1.80 m·183×60 mm.
+S24 기록 (RTX 4060, venv_ffs, 640×480, 초점 1 m 고정): 오프라인 — 사람 seg 0.395/0.412 m (bbox 는 사람이 화면 대부분이라 배경 혼입 → seg 를 볼 것). 라이브 25초 — 367쌍 15.0 fps, FFS+YOLO(seg+bbox) 80회, 중앙값 258 ms, 첫 쌍 dy 0.32px·인라이어 0.95, 벽시계 1.80 m·183×60 mm.
 
 **HAL의 동기 등급은 `APPROXIMATE`**이므로 동일한 논리 timestamp만으로 동시 노출을 보장할 수 없다. 앱은 `Image.getTimestamp()`와 **정확히 같은 논리 `SENSOR_TIMESTAMP`**의 촬영 결과를 찾아, 해당 렌즈의 물리 `SENSOR_TIMESTAMP`를 전송한다. 이미지/결과 콜백은 어느 쪽이 먼저 와도 연결하며, 결과 또는 물리 timestamp가 없으면 이전 오프셋을 재사용하지 않는다. 대기 항목은 24개/1초로 제한한다. Android `RESULT` 로그의 `matched`, `unmatched_dropped`로 연결 및 대기 이미지 폐기 수를 확인한다.
 
@@ -80,15 +80,17 @@ PC는 첫 렌즈 프레임 시각을 기준으로 다른 렌즈의 앞뒤 후보
 
 연결 로직 회귀 테스트: `./venv/bin/python -m unittest phone_stereo.test_receiver phone_stereo.test_timestamp_matcher` (Java 테스트에 JDK 필요).
 
+**라이브 정류 검사**: depth 를 내기 전, 질감 있고 **정지한** 쌍 3개의 dy 중앙값이 1 px 미만인지 본다(그 전엔 객체에 `rectification_unverified`). 노출+롤링셔터 동안 회전으로 상이 1 px 이상 움직인 쌍은 세지 않는다(보고서 `motion_px`). 두 렌즈 노출 차 동안의 회전은 자이로로 보정한다(보고서 `gyro_skew_compensation_deg`). 다른 폰의 캘리는 dy 20 px 이상이라 `Phone rectification failed` 로 멈춘다. S25 실측 라이브: 289초, 추론 687회 중앙값 239 ms(RTX 4050), 판정 dy 0.31 px.
 
-**거리 정확도 한계**: baseline 15.76 mm 라 1 m 에서 시차가 7px 뿐이다. 시차 0.5px 오차 → 깊이 오차 ≈ Z²×0.070 (0.5 m 18 mm, 1 m 70 mm, 2 m 0.28 m). 캘리 yaw 0.1° 오차는 시차 0.76px 편향 = 1 m 에서 11%. `metric` 이 아닌 상태의 결과에는 객체마다 `scale_not_validated:<status>` 경고가 붙는다.
+
+**거리 정확도 한계**: baseline 은 S25 공장값 16.30 mm(S24 15.76 mm), 정류 후 f ≈ 438 px 라 1 m 에서 시차가 7.1 px 뿐이다. 시차 0.5px 오차 → 깊이 오차 ≈ Z²×0.070 (0.5 m 18 mm, 1 m 70 mm, 2 m 0.28 m). 캘리 yaw 0.1° 오차는 시차 0.76px 편향 = 1 m 에서 11%. `metric` 이 아닌 상태의 결과에는 객체마다 `scale_not_validated:<status>` 경고가 붙는다.
 
 ## 폰 센서 (IMU·기압)
 
 앱이 자이로·중력·선가속도·게임 회전벡터·회전벡터(125 Hz), 기압(12.5 Hz)을 같은 소켓으로 보낸다(magic `SENS`, payload float32). 카메라와 같은 elapsedRealtimeNanos 시계라 프레임 시각의 센서값을 찍어 `pair.json`의 `imu` 와 depth 보고서 `imu`/`imu_raw` 에 넣는다. `summary.json` 의 `imu` 에 센서별 표본수·주기, `clock_gap_ms` 에 시계 일치 확인값이 있다.
 
 - **중력 정렬**: 객체 `center_world_m` (x 카메라 오른쪽 수평, y 수평 전방, z 위), `height_rel_camera_m`, 보고서 `imu.pitch_deg/roll_deg`.
-- **이동 스테레오** (`z_phone_motion.py`): GUI 에서 `S` 로 A 저장 → 폰을 10~20 cm 옆으로 옮겨 정지 → `S` 로 B 저장(10초 안에) → `./venv/bin/python z_phone_motion.py --a <A> --b <B>` (회전은 회전벡터, 이동방향은 영상, 크기는 15.76 mm 스테레오, 가속도 적분은 교차검증). `--dense` (venv_ffs) 면 이동 쌍을 정류해 FFS+seg 를 돌린다. 정지 상태 두 번들은 `baseline_unreliable` 로 거부된다.
+- **이동 스테레오** (`z_phone_motion.py`): GUI 에서 `S` 로 A 저장 → 폰을 10~20 cm 옆으로 옮겨 정지 → `S` 로 B 저장(10초 안에) → `./venv/bin/python z_phone_motion.py --a <A> --b <B>` (회전은 회전벡터, 이동방향은 영상, 크기는 두 렌즈(약 16 mm) 스테레오, 가속도 적분은 교차검증. 폰을 제자리에서 돌리기만 하면 `스케일을 줄 수 있는 대응점 N개` 로 거부된다). `--dense` (venv_ffs) 면 이동 쌍을 정류해 FFS+seg 를 돌린다. 정지 상태 두 번들은 `baseline_unreliable` 로 거부된다.
 - IMU 는 두 렌즈 사이 기하(yaw·baseline)를 관측하지 못한다 — 그건 `--known`/`--board` 의 몫이다.
 
 ## 파일과 검증
@@ -96,12 +98,13 @@ PC는 첫 렌즈 프레임 시각을 기준으로 다른 렌즈의 앞뒤 후보
 - `phone_stereo/android/src/com/camera/dualstream/MainActivity.java`: Camera2 촬영·물리 ID 조회·NV21 전송.
 - `phone_stereo/build_android.py`: Google Android SDK 35 플랫폼과 build-tools 35.0.0의 고정 다운로드/체크섬 검증, Java APK 빌드. 다운로드 도구와 개발 서명 키는 Git에 저장하지 않는다.
 - `lib_phone_stereo.py`: 분할 TCP 패킷 처리·타임스탬프 pairing·수신 통계.
-- `z_phone_stereo.py`: 설치·시작·PC 표시·GPU 추론·원본 저장·종료.
+- `z_phone_stereo.py`: 설치·시작(폰 화면 깨우기 포함)·PC 표시·GPU 추론·원본 저장·종료. 캘리 촬영용 `--save-interval --still --board-hud`, PC 화면 보드 표시 `--show-board`(1:1 확인, 저장 상태·두 렌즈 뷰파인더를 여백에 표시).
 - `lib_phone_depth.py`: 폰 쌍의 보정값 검증 및 기존 FFS depth 파이프라인 연결.
 - `lib_phone_calib.py` / `z_phone_calib.py`: 공장 CameraCharacteristics → OpenCV 스테레오 캘리, 장면 회전 보정, 체커보드 stereoCalibrate, `--known`, `--check`.
 - `lib_phone_motion.py` / `z_phone_motion.py`: 회전벡터 + 영상 + 스테레오 스케일로 폰 이동 두 시점을 넓은 baseline 스테레오로.
-- `phone_stereo/cameras_s24.json`: 이 S24 의 `--list` 결과 사본 (runs/ 는 git 에 없으므로).
+- `phone_stereo/cameras_s24.json`: 이전 S24 의 `--list` 결과 사본. 현재 폰(S25)의 공장값은 `--list` 가 `phone_stereo/runs/cameras.json` 에 저장하고, `z_phone_calib.py` 가 그 파일을 우선 읽는다.
 - `phone_stereo/test_receiver.py`: 잘린/손상된 패킷, 프레임 누락·재사용 방지, 다른 카메라 보정값 거부 테스트.
+- `phone_stereo/test_phone_depth.py`: 라이브 정류 판정(질감 없는 쌍·움직이는 쌍 제외, 3쌍 중앙값, 틀린 캘리 거부, 오프라인 1쌍) 테스트.
 
 ```bash
 ./venv/bin/python -m unittest discover -s phone_stereo -p 'test_*.py' -v
@@ -112,7 +115,7 @@ PC는 첫 렌즈 프레임 시각을 기준으로 다른 렌즈의 앞뒤 후보
 ## RGB·깊이·3D·IMU 통합 뷰어
 
 ```bash
-cd /home/karma/camera
+cd <저장소 루트>   # 예: /home/leajeajun/Desktop/StereoDepthSeg
 ./venv_ffs/bin/python z_phone_stereo.py \
   --physical 2 5 --calib-stereo calib_phone_pair.json --yolo seg \
   --rgbd-viewer --out phone_stereo/runs/my_view

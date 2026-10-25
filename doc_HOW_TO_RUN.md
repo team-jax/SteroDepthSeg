@@ -1,8 +1,10 @@
 # 실행 절차
 
-모든 명령은 `/home/karma/camera` 에서 `./venv/bin/python` 으로 실행한다.
+모든 명령은 저장소 루트에서 `./venv/bin/python` 으로 실행한다.
 
-준비물: **자(또는 줄자)**, **Galaxy S24**, 곧은 모서리(자·책등) 하나.
+준비물: **자(또는 줄자)**, **Galaxy 폰(S24/S25 — 둘 다 2340x1080 화면이라 `target_s24.png` 그대로 사용)**, 곧은 모서리(자·책등) 하나.
+
+> 폰 두 렌즈 depth(현재 주력, S25)만 쓴다면 이 문서의 1~5단계(웹캠)는 필요 없다. 아래 "폰 두 렌즈만으로" 절과 [doc_CALIBRATION.md](doc_CALIBRATION.md)를 볼 것.
 자가 없으면 미터 단위 좌표는 원리적으로 나오지 않는다.
 
 ---
@@ -13,7 +15,7 @@
 ./venv/bin/python z_calibrate.py --make-target
 ```
 
-`target_s24.png` (2340x1080) 가 생긴다. 이 파일을 S24로 옮긴다.
+`target_s24.png` (2340x1080) 가 생긴다. 이 파일을 폰(S24/S25)으로 옮긴다.
 
 **폰에서:**
 1. 사진을 **전체화면**으로 연다.
@@ -289,23 +291,24 @@ Fast-FoundationStereo 로 화소마다 깊이를 구해 객체별 거리·크기
 
 ## 폰 두 렌즈만으로 (노트북 카메라 없이) — `z_phone_calib.py` + `z_phone_stereo.py`
 
-S24 후면 초광각(2)·광각(5) 프레임을 앱이 동시에 보내므로 폰 하나가 스테레오 카메라다. 두 렌즈 사이 거리는 15.76 mm 로
-고정돼 있어 캘리브레이션을 한 번만 하면 된다. 이미 `calib_phone_pair.json` (회전 보정, `factory_baseline_refined`) 이 있으니
-바로 depth 를 볼 수 있고, 거리 스케일을 확정하려면 아래 체커보드 단계를 한 번 한다.
+폰 후면 초광각(2)·광각(5) 프레임을 앱이 동시에 보내므로 폰 하나가 스테레오 카메라다. 두 렌즈 사이 거리는 고정(S25 공장값 16.30 mm,
+S24 15.76 mm)이라 **폰마다** 캘리브레이션을 한 번 하면 된다.
+
+> **현재 `calib_phone_pair.json` 은 S25 용 `metric` 이다 (2026-10-25).** 폰을 바꾸면 [doc_CALIBRATION.md](doc_CALIBRATION.md) 1~6단계를 다시 한다. 아래 명령들은 그 요약이다.
 
 ```bash
 # 0) 앱 설치·렌즈 목록 (최초 1회) — cameras.json 에 공장 캘리값이 저장된다
 ./venv/bin/python z_phone_stereo.py --install --list
 
-# 1) 바로 depth (현재 파일: 회전 보정본, 스케일 미검증 경고 붙음). 초점은 기본 1 m 고정(--focus-m) — 캘리와 같은 값으로
+# 1) depth. 초점은 기본 1 m 고정(--focus-m) — 캘리와 같은 값으로. 처음 몇 초는 0.6 m 이상 떨어진 물체에 대고 정지
 ./venv_ffs/bin/python z_phone_stereo.py --physical 2 5 --calib-stereo calib_phone_pair.json --yolo both
 
 # 2) 정류가 맞는지 확인 (저장된 번들에서 dy 중앙값 < 1px, 인라이어 ≥ 0.7 이면 OK)
 ./venv/bin/python z_phone_calib.py --check phone_stereo/runs/<번들>
 
 # 3) 회전 보정 다시 하기 (폰을 떨어뜨렸거나 dy 가 커졌을 때): 방 전체가 보이는 질감 있는 장면 쌍 3~6개
-./venv/bin/python z_phone_stereo.py --physical 2 5 --headless --save-interval 2 --duration 20   # 폰을 천천히 돌리며
-./venv/bin/python z_phone_calib.py --refine phone_stereo/runs/<실행시각>
+./venv/bin/python z_phone_stereo.py --physical 2 5 --save-interval 2 --still --duration 40 --out phone_stereo/runs/scene   # 방향 바꿀 때마다 1초 정지, 6쌍 이상
+./venv/bin/python z_phone_calib.py --refine phone_stereo/runs/scene
 ```
 
 ### 절대거리 빠른 고정 (`known_distance_pinned`) — 자로 잰 거리 1개
@@ -326,15 +329,17 @@ ROI 안 SIFT 대응점이 8개 미만이면 질감 부족으로 거부한다.
 ### 스케일 확정 (`metric`) — 노트북 화면 체커보드
 
 ```bash
-./venv/bin/python z_calibrate.py --make-target --screen laptop     # 노트북/태블릿 전체화면에 보드 표시, 기준 막대를 자로 실측 (태블릿 145 mm 도 OK)
-./venv/bin/python z_phone_stereo.py --physical 2 5 --size 960 720 --save-interval 1.5 --still --board-hud --duration 180 --out phone_stereo/runs/board2
-./venv/bin/python z_phone_calib.py --board phone_stereo/runs/board2 --screen laptop --ruler-mm 145 --size 960 720 --target-size 640 480 --base calib_phone_pair.json
+./venv/bin/python z_calibrate.py --make-target --screen laptop     # target_laptop.png. 기준 막대를 자로 실측하거나, 이 PC 화면이면 EDID 폭으로 계산(MSI Katana 17: 199)
+# 보드를 이 PC 화면에 띄우는 경우: 폰을 40 cm 앞에 고정하고 노트북을 움직인다 (테두리 초록 = 저장)
+./venv/bin/python z_phone_stereo.py --physical 2 5 --size 960 720 --save-interval 1.5 --still --board-hud --show-board target_laptop.png --duration 300 --out phone_stereo/runs/board
+./venv/bin/python z_phone_calib.py --board phone_stereo/runs/board --screen laptop --ruler-mm 199 --size 960 720 --target-size 640 480 --base phone_stereo/runs/calib_s25_refine.json --free-intrinsics   # --base 는 이 폰의 refine 결과
 ```
 
 - 화면에 렌즈별 `BOARD OK / NO BOARD`, 아래에 저장/미저장 이유(`MOVING`, `SAME VIEW`, `WAIT`, `SAVED #n`)가 뜬다.
   **찍히는 순간 폰도 보드도 정지**해야 한다(두 렌즈 노출 시각이 달라서, 문제점 18). 보드(태블릿)를 새 위치에 놓고 손 떼고 1초 →
-  `SAVED` 뜨면 다음 위치. 거리 35~50 cm, 위/아래/좌/우/기울기 섞어 20장 이상. 2026-09-22 실측: 26장 → RMS 0.26 px, `metric`.
-- 통과 조건: rms ≤ 1 px, 뷰 ≥ 8, baseline 이 공장값 15.76 mm 의 ±15% 안. 하나라도 어긋나면 `board_unreliable` 로 기록하고
+  `SAVED` 뜨면 다음 위치. 거리 35~45 cm, 위/아래/좌/우/기울기 섞어 20장 이상. 2026-09-22 S24 실측(태블릿 145 mm): 26장 → RMS 0.26 px. 2026-10-25 S25(이 PC 화면, `--show-board`): 39장 → RMS 0.105 px, baseline 16.64 mm, `metric`.
+- S25 는 초광각 스트림이 크롭이라 공장 K 가 맞지 않는다 → `--free-intrinsics`(렌즈별 단독 캘리 후 R·T) 필수. 빠뜨리면 거부된다.
+- 통과 조건: rms ≤ 1 px, 뷰 ≥ 8, baseline 이 공장값(S25 16.30 mm)의 ±15% 안. 하나라도 어긋나면 `board_unreliable` 로 기록하고
   이유를 출력한다 (metric 으로 올리지 않는다).
 - 통과 뒤 실측 1개로 확인: 자로 잰 물체까지 거리와 `depth.json` 의 `dist_m` 비교.
 
@@ -346,13 +351,13 @@ ROI 안 SIFT 대응점이 8개 미만이면 질감 부족으로 거부한다.
 ./venv_ffs/bin/python z_phone_motion.py --a ... --b ... --dense     # 이동 쌍 FFS + seg → motion_depth.png / motion.json
 ```
 
-회전은 게임 회전벡터(자이로), 이동 방향은 영상 대응점, 크기는 15.76 mm 스테레오(3-뷰 삼각측량), 가속도 2회 적분은 교차검증.
-baseline 15 cm 면 1 m 에서 시차 0.5 px 오차가 깊이 0.7 % (두 렌즈 7 %). 절대값 편향은 15.76 mm 캘리의 yaw 를 물려받으니
+회전은 게임 회전벡터(자이로), 이동 방향은 영상 대응점, 크기는 두 렌즈(약 16 mm) 스테레오(3-뷰 삼각측량), 가속도 2회 적분은 교차검증.
+baseline 15 cm 면 1 m 에서 시차 0.5 px 오차가 깊이 0.7 % (두 렌즈 7 %). 절대값 편향은 두 렌즈 캘리의 yaw 를 물려받으니
 `--known`/`--board` 뒤에 쓰면 절대 미터. 결과 보고서의 `center_world_m` 은 중력으로 정렬한 Z-up 좌표(카메라 기준 높이 포함).
 
 ### 정확도를 미리 알고 볼 것
 
-baseline 15.76 mm, f ≈ 451 px(정류 후) 이면 시차 = 7.1 px / Z[m]. 시차 0.5 px 오차 → 깊이 오차 ≈ Z² × 0.070 m:
+S25: baseline 16.30 mm, f ≈ 438 px(정류 후, 공장값 기준) 이면 시차 = 7.1 px / Z[m] (S24 도 15.76 mm × 451 px 로 거의 같다). 시차 0.5 px 오차 → 깊이 오차 ≈ Z² × 0.070 m:
 
 | 거리 | 0.5 m | 1 m | 2 m | 3 m |
 |---|---|---|---|---|
@@ -375,9 +380,10 @@ baseline 15.76 mm, f ≈ 451 px(정류 후) 이면 시차 = 7.1 px / Z[m]. 시�
   (중복 보정 방지). 거부되면 `z_reconstruct.py` 를 다시 돌린 뒤 하면 된다.
 - 조밀 경로 `ambiguous` 는 영역 안 깊이가 두 덩어리(물체+배경)라 물체를 확정하지 못한 경우다.
   `depth_clusters` 에 두 군집의 크기·깊이·중앙지지가 남으니 보고 판단하고, seg 모드를 쓰면 대개 사라진다.
-- 회귀 테스트: `./venv/bin/python z_selftest.py` (GPU·카메라 불필요, 18항목).
+- 회귀 테스트: `./venv/bin/python z_selftest.py` (GPU·카메라 불필요, 31항목), 폰 쪽 `./venv/bin/python -m unittest discover -s phone_stereo -p 'test_*.py'` (21개).
 - 조밀 경로 끝단 검증: `./venv/bin/python z_make_synth_pair.py` 로 정답 쌍을 만든 뒤
   `./venv_ffs/bin/python z_object_depth.py --pose stereo --left synth_pair/L.png --right synth_pair/R.png --calib-l synth_pair/calib_l.json --calib-r synth_pair/calib_r.json --calib-stereo synth_pair/calib_stereo.json --known-m 1.501 --known-idx 2`
+  (현재 PC: RTX 4050 6 GB + `python3.12-dev` 없음(순수 PyTorch 경로) → 1280×720 은 GPU 메모리 부족, `--scale 0.5` 로 실행. `sudo apt install python3.12-dev` 뒤엔 triton 경로로 원해상도 가능)
 
 ## 결과 읽을 때 반드시 알아야 할 한계
 

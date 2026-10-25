@@ -1,6 +1,43 @@
 # STATUS
 
-최종 갱신: 2026-09-22
+최종 갱신: 2026-10-25
+
+## 현재 상태 요약 (2026-10-25)
+
+- **전체 목표(현재)**: 폰 후면 두 렌즈(Galaxy S25 초광각 2 + 광각 5) 스테레오 → PC 에서 FFS 조밀 깊이 + YOLO seg 로 객체별 거리·3D·크기, RGB-D·IMU 뷰어. 진입점 `z_phone_stereo.py` (README.md).
+- **했던 일**: S25 두 렌즈 캘리 `metric` (보드 39뷰, RMS 0.105 px, baseline 16.64 mm, FFS vs 보드 PnP +0.8%), 라이브 289초 무오류(추론 중앙값 239 ms, 정류 판정 0.31 px). 캘리 도구·라이브 판정·자이로 보상 수정 다수 (아래 2026-10-22~25 항목, doc_REPO_ANALYSIS.md §6).
+- **하고 있는 일**: 없음 (전체 점검·문서 동기화 완료, 2026-10-25).
+- **할 일**: (선택) 크기 아는 물체로 독립 거리 확인 · `sudo apt install python3.12-dev` (FFS 1280×720 원해상도; 지금은 `--scale 0.5`) · 1·2세대 웹캠 경로를 쓰려면 이 PC 웹캠으로 `calib.json` 재캘리 (지금 파일은 이전 노트북 HP 웹캠).
+- **사용 기술(현재 PC)**: Ubuntu, RTX 4050 Laptop 6 GB(드라이버 580, nvidia-powerd), venv py3.12(opencv 4.13, torch 2.14+cu130, ultralytics 8.4.157, open3d 0.20), venv_ffs py3.12(torch 2.6+cu124, xformers, opencv 5.0), Fast-FoundationStereo C 가중치, Android Camera2 앱(`phone_stereo/`).
+- **테스트**: `z_selftest.py` 31/31, `unittest discover -s phone_stereo` 21개(Java 포함), `research/.../reproduce_after.py` 기록과 일치.
+
+## 2026-10-22: 저장소 분석·캘리 절차 문서화, 폰 교체(S24→S25) 확인
+
+- 새 문서: [doc_REPO_ANALYSIS.md](doc_REPO_ANALYSIS.md) (전체 구조·흐름·현재 환경), [doc_CALIBRATION.md](doc_CALIBRATION.md) (폰 두 렌즈 캘리 1~6단계 + 웹캠 부록 + 검증 기록).
+- **연결된 폰이 Galaxy S25(SM-S931N)** 로 바뀌었다. 공장 baseline 16.30 mm(S24 15.76), K 도 다르다. 기존 `calib_phone_pair.json`(S24)을 S25 쌍에 적용하면 dy 27 px → 재캘리 필요.
+- 문서 절차를 합성 데이터(S25 공장 K + 알려진 참 포즈)로 끝까지 실행: board 결과 baseline 16.04 mm(참 16.00), 회전 오차 0.013°, 0.80 m 판 FFS −0.33%. refine 만이면 +38% (yaw 미관측).
+- 수정: `--list` 가 `phone_stereo/runs/cameras.json` 에도 저장(기본 인벤토리가 S24 사본으로 빠지던 문제), `--base` 다른 폰 파일 거부(공장 baseline 1% 비교), 저장 게이트 출력 스팸, 경고 문구 baseline 하드코딩. venv 에 open3d 0.20.0 설치.
+- 전체 실행 점검(같은 날): selftest 31/31, 폰 unittest 18/18(신규 2), APK 빌드, FFS 스모크, 합성 쌍 조밀(FFS)·희소(SIFT) 복원, z_stereo_pose provisional→rescale(중복 보정 거부 확인), README 라이브 명령(S25 실기기 15초, 219쌍, 추론 42회 중앙값 239 ms, rgbd 파일 8종).
+  - 수정: `PhoneDepth` 정류 검사가 첫 쌍이 unavailable 이면 영영 안 돌던 결함 → 판정 날 때까지 재검사 (S24 캘리 + S25 실번들에서 dy 24 px 로 중단 확인).
+  - 수정: `reproduce_after.py` 의 손으로 베낀 `unavailable` 스텁(키 누락 KeyError) → 실제 함수 반환값 사용.
+  - 환경: venv 에 `pip install -r requirements.txt` (torch 2.14.0+cu130). `python3.12-dev` 없음 → FFS 1280×720 OOM(GPU 5.6 GB), `--scale 0.5` 로 실행. sudo 필요.
+- 2026-10-25 S25 refine 실측: 광각 fx 스케일 0.8215. 영상 두 장의 실제 배율 1.38~1.39 vs 공장 K 1.665 → 초광각 스트림 크롭 추정(초광각 fx ≈308, 공장 256). 합성 재현: K 고정 보드 캘리는 RMS 0.90 px 로 `metric` 통과하나 거리 −15.3%, `--free-intrinsics` 는 +0.2%.
+  - 파라미터 추가: `BOARD_FOCAL_SCALE_TOL = 0.05` (z_phone_calib.py) — K 고정 보드 캘리에서 base 광각 fx 스케일 편차가 5% 초과면 `board_unreliable`. S24(0.991) 는 영향 없음, S25(0.82) 는 `--free-intrinsics` 강제.
+- 2026-10-25 촬영 실패 `CAMERA_DISABLED ... cannot open camera "0" from background`: S25 화면이 꺼진 상태에서 앱이 화면 뒤에서 시작됨(런처가 전면). 수정: `start_phone` 이 `KEYCODE_WAKEUP` + `wm dismiss-keyguard` 후 실행, 이 오류는 원인 안내 메시지로. 폰 설정 `stay_on_while_plugged_in` 0 → **2** (USB 연결 중 화면 유지, S24 때와 동일). 화면 끈 상태에서 시작해 정상 수신 확인.
+- 2026-10-25 S25 3단계(refine) 통과: 7쌍 dy 0.30~0.72 px, 광각 fx 스케일 0.822. 5단계 첫 촬영은 0장(손떨림으로 정지 판정 0회, 70~80 cm 라 초광각 보드 미검출, 보드가 화면을 덮어 상태를 못 봄).
+  - 추가: `z_phone_stereo.py --show-board PNG` — 이 PC 화면에 보드를 1:1 전체화면으로 띄우고 저장 상태를 여백(테두리 색·글자)에 표시. 전체화면 요청이 가끔 무시되는 것(실측 400x225)을 재요청으로 처리, 1:1 확인 전에는 저장 안 함, 5초 안에 1:1 이 안 되면 중단. 테두리·글자가 있어도 코너 검출 18/18 확인.
+  - `--ruler-mm` 자 없이: EDID 폭 382 mm / 1920 px → 199.
+- **2026-10-25 S25 `metric` 달성**: 폰 고정 + 노트북 이동 + `--show-board` 로 보드 39뷰. 렌즈별 단독 캘리 fx@640 초광각 312.1(공장 256, 스트림 크롭) / 광각 423.5(공장 426), stereoCalibrate RMS 0.105 px, baseline 16.64 mm(공장 16.30), FFS vs 보드 PnP 거리 +0.8%(최대 1.1%, 0.40~0.60 m 13뷰), 장면 7쌍 dy 0.25~0.55 px.
+  - 수정: `board_stereo_calibrate(fix_intrinsics=False)` — refine K 초기값으로 K·R·T 공동 추정(USE_INTRINSIC_GUESS) → 렌즈별 calibrateCamera 후 FIX_INTRINSIC 로 R·T 만. 공동 추정이 실데이터에서 fx 258/349·baseline 19.75 mm 로 틀리게 수렴했다(게이트가 거부). 합성 두 경우(크롭/비크롭)도 참 fx 재현.
+  - 이전 판단 정정: refine 광각 스케일 0.82 는 "광각 fx 가 작다" 가 아니라 초광각 크롭을 광각 쪽에 흡수한 값.
+- 2026-10-25 라이브 첫 쌍 `Phone rectification failed` (dy 1.058 px, 손에 든 폰 gyro ~0.09 rad/s; 같은 실행 마지막 쌍 0.74 px OK). 원인: 한 쌍으로 라이브 전체를 판정. 수정: `PhoneDepth.check_rectification` — 질감 있는 쌍 3개(`ep_need=3`)의 dy 중앙값으로 판정, 그 전엔 `pending`(객체 `rectification_unverified`). 오프라인은 번들 한 쌍(`ep_need=1`). S24 캘리+S25 번들은 여전히 dy 24 px 로 거부, 테스트 3개.
+- 2026-10-25 FFS 640×480 4회 4.5 s/프레임, YOLO 207 ms (10-22 엔 239 ms 전체). nvidia-smi: 전원 연결·배터리 100% 인데 GPU Power Limit 15 W (기본 80 W), SW Power Cap·SW Thermal Slowdown 활성, GPU 49°C. 같은 날 s2idle 절전 2회(20:25, 21:16) 뒤 — 절전 복귀 후 전력 제한 고착으로 추정(미확정). `nvidia-powerd` 는 설치돼 있으나 서비스 미등록. 해결은 sudo 필요(재부팅 또는 nvidia-powerd 서비스 등록).
+- 2026-10-25 GPU 해결: nvidia-powerd 서비스 등록 + D-Bus 정책(`/etc/dbus-1/system.d/nvidia-dbus.conf`, NVIDIA 보안 강화판 CVE-2022-31608) 후 재부팅(21:52) → FFS+YOLO 라이브 중앙값 241 ms. 원인은 절전 복귀 후 GPU 210 MHz 고착(재부팅으로 해소).
+- 2026-10-25 라이브 재실패 dy [0.60, 4.77, 2.59] — 폰을 3.3 rad/s 로 돌리던 쌍. 수정 2개:
+  - `gyro_integrated_rotation`: [tA,tB] 안 표본만 쓰던 것 → 표본 구간과의 겹침 적분. 노출 차(~6 ms) < 자이로 주기(~10 ms) 라 동기 보상이 항상 0 이었다. 실데이터 창으로 1.094° (기대 1.09°).
+  - `check_rectification(motion_px)`: |ω|·(노출+롤링셔터 skew)·f ≥ EPI_GATE_PX 인 쌍은 판정에 안 셈 (`motion_px` 는 depth 보고서에도 기록). 새 상수 없음.
+  - 실기기 20 초: 295쌍, 추론 63회 241 ms, 정류 판정 ok (dy 0.526/0.640/0.362, 중앙 0.53 px). 폰 unittest 21, selftest 31/31.
+- 할 일: 크기 아는 물체로 독립 거리 확인(선택), `sudo apt install python3.12-dev`(FFS 1280×720 OOM 해소).
 
 ## 폰 두 렌즈(초광각 2 + 광각 5)만으로 metric depth — **metric 달성** (2026-09-22)
 
@@ -78,7 +115,7 @@
 - 현행 소스: `lib_rectify.py`, `lib_ffs.py`, `z_object_depth.py`와 seg·planar 처리가 검토 중 추가되어 읽고 재검증했다. 이 조사 작업은 애플리케이션 코드를 변경하지 않았다.
 - 다음 작업: 검토 문서의 기하·객체 영역·스케일/실패 상태 수정안을 적용한 뒤 FFS 환경·GPU 추론 및 실제 거리·속도 검증. 이번 조사에서 FFS GPU 추론의 성공 여부는 판정하지 않았다.
 
-## 전체 목표
+## 전체 목표 (1세대 시작 시, 2026-09-21)
 
 카메라로 객체를 인식하고 삼각측량으로 그 **3D 좌표와 크기**를 확정한 뒤,
 파이썬 3D 맵에 재배치해 보여준다. 카메라 1대 버전과 2대 버전을 모두 만든다.
@@ -92,7 +129,7 @@
 - 객체 인식: 수동 ROI 로 파이프라인 검증 → YOLO 자동 검출
 - 시각화: Open3D 3D 맵에 점군 + 박스 + 촬영 위치 배치
 
-## 사용 기술
+## 사용 기술 (1세대, 이전 PC — 현재 환경은 맨 위 요약)
 
 | 항목 | 선택 | 근거 |
 |---|---|---|
@@ -107,7 +144,7 @@
 | 배경 분리 | DBSCAN (`cluster_dbscan`) | 아래 "문제점" 3번 참조 |
 | 캘리 타겟 | Galaxy S24 화면 (가로) | 프린터 없음. 내장캠은 자기 화면을 못 봄 |
 
-## 했던 일
+## 했던 일 (1세대 웹캠 경로, 2026-09-21)
 
 - [x] 환경 구성 (venv + 의존성) — import 및 실제 API 동작 확인
 - [x] `lib_calib.py` — 체커보드 PNG 생성 + 캘리브레이션
@@ -134,7 +171,7 @@
 - [x] `z_capture.py --board` + `z_reconstruct.py` mode=board 배선
 - [x] `doc_HOW_TO_RUN.md` — 촬영 절차
 
-## 하고 있는 일
+## 하고 있는 일 (1세대 웹캠 경로 기록, 2026-09-21 — 현재는 맨 위 요약)
 
 **본 촬영 대기.** 캘리브레이션은 끝났다(`calib.json`). 다음은 실물 촬영이라
 AI가 대신할 수 없다.
@@ -144,7 +181,7 @@ AI가 대신할 수 없다.
 ./venv/bin/python z_reconstruct.py          # 드래그로 대상 지정
 ```
 
-## 할 일
+## 할 일 (1세대 웹캠 경로 기록 — 현재는 맨 위 요약)
 
 - [x] ~~2단계 게이트 실측~~ — RMS 0.2326px, 커버리지 16/16 로 통과
 - [ ] **4단계 게이트 실측** — 자로 잰 물체 치수 대비 오차 < 10%
