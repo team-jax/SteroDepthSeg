@@ -22,6 +22,7 @@ MAGIC = 0x53544552
 MAGIC_SENSOR = 0x53454E53
 # android.hardware.Sensor 타입 상수 (앱이 등록하는 것만)
 SENSOR_GYRO, SENSOR_PRESSURE, SENSOR_GRAVITY, SENSOR_LINEAR_ACC, SENSOR_ROTVEC, SENSOR_GAME_ROTVEC = 4, 6, 9, 10, 11, 15
+LENS_OFFSET_SPAN_MS = 100          # HAL 이 두 렌즈에 같은 시각을 보고할 때 실제 노출 차를 찾는 범위(± ms). 센서 프레임 주기 66.7 ms + 위상 흔들림
 SENSOR_FRAME_TIMING = 100          # 앱 자체 타입: [물리별 SENSOR_TIMESTAMP − 논리 timestamp (ms)…, 노출 ms, 프레임 주기 ms, 롤링셔터 skew ms]
 SENSOR_NAMES = {SENSOR_GYRO: "gyroscope", SENSOR_PRESSURE: "pressure", SENSOR_GRAVITY: "gravity",
                 SENSOR_LINEAR_ACC: "linear_acceleration", SENSOR_ROTVEC: "rotation_vector", SENSOR_GAME_ROTVEC: "game_rotation_vector",
@@ -192,7 +193,11 @@ class PhoneReceiver:
         out["per_frame"] = [self.imu_at(t) for t in ts]
         out["exposure_ts_ns"] = ts
         out["exposure_skew_ms"] = (ts[1] - ts[0]) / 1e6
-        out["gyro_window"] = self.sensor_window(SENSOR_GYRO, ts[0], ts[1]) if ts[0] != ts[1] else []
+        if ts[0] != ts[1]:
+            out["gyro_window"] = self.sensor_window(SENSOR_GYRO, ts[0], ts[1])
+        else:      # 같은 시각 = 실제 차를 모르는 상태 → 추정에 쓸 넓은 창 (lib_phone_depth.estimate_lens_offset)
+            span = int(LENS_OFFSET_SPAN_MS * 1e6)
+            out["gyro_window"] = self.sensor_window(SENSOR_GYRO, ts[0] - span, ts[0] + span, pad_ns=0)
         return out
 
     def stats(self):

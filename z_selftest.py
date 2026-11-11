@@ -152,10 +152,62 @@ def t_dense():
     check(f"seg: 크기 {d[0]:.1f}x{d[1]:.1f} (오차 {e[0]:.2f}%/{e[1]:.2f}%), 중심오차 {ec:.1f}mm, status {rec['status']}",
           max(e) < 3 and ec < 10 and rec["status"] == "ok")
     check("선택 화소 통계와 원시 중앙값이 분리 저장됨", rec["depth_raw_m"] is not None and rec["selected_fraction"] is not None)
+    rot = rec["rotation"]                                            # 정답: 오른쪽 끝이 멀어지게 20° (yaw +20), 위아래 기울기 0, 긴 변 수평 (roll 0)
+    # 허용: 깊이 노이즈 2% 에서 측정한 오차(yaw +0.65, pitch +0.1, roll +0.1, 5 시드 ±0.2) 의 약 2배. SVD 법선이면 yaw +2.6 으로 이 검사에 걸린다
+    check(f"회전: yaw {rot['yaw_deg']:+.1f} (정답 +20), pitch {rot['pitch_deg']:+.1f} (0), roll {rot['roll_deg']:+.1f} (0), tilt {rot['tilt_deg']:.1f}, 법선 {rot['normal_source']}",
+          abs(rot["yaw_deg"] - 20) < 1.5 and abs(rot["pitch_deg"]) < 1.0 and abs(rot["roll_deg"]) < 1.0 and not rot["roll_ambiguous"]
+          and rot["normal_source"] == "disparity-plane")
+    check("회전 표시 문자열", zod.rotation_text(rot) is not None and "yaw +" in zod.rotation_text(rot))
     # 배경 과반 bbox -> ambiguous 여야 한다 (배경을 물체로 보고하지 않음)
     x, y, w, h = det["box"]; big = np.zeros((H, W), np.uint8); big[max(0, y-150):y+h+150, max(0, x-200):x+w+200] = 255
     rec2 = zod.aggregate(zod._empty("obj", 1, det, "bbox"), big, valid, Z, pts)
     check(f"배경 과반 bbox -> status {rec2['status']}, 선택비율 {rec2['selected_fraction']:.2f}", rec2["status"] in ("ambiguous", "ok") and (rec2["selected_fraction"] < 0.5 or abs(rec2["depth_rect_m"] - 1.5) < 0.1))
+
+
+def t_outline_guard():
+    print("planar_box 경계 광선: 면과 거의 평행한 광선이 섞여도 폭·중심이 튀지 않는다")
+    rng = np.random.default_rng(0)
+    th = np.radians(65); ex = np.array([np.cos(th), 0, np.sin(th)]); ey = np.array([0, 1.0, 0]); C = np.array([0.3, 0.0, 1.2])
+    a, b = rng.uniform(-.15, .15, 4000), rng.uniform(-.10, .10, 4000)
+    P = C + np.outer(a, ex) + np.outer(b, ey) + rng.normal(0, 0.002, (4000, 3))
+    edge = np.concatenate([C + np.outer(t, ex) + s * ey for t in np.linspace(-.15, .15, 40) for s in (-.1, .1)]
+                          + [C + np.outer(np.linspace(-.1, .1, 40), ey) + s * ex for s in (-.15, .15)])
+    rays = edge / np.linalg.norm(edge, axis=1, keepdims=True)
+    n = np.cross(ex, ey); n /= np.linalg.norm(n); par = np.cross(n, [0, 1, 0]); par /= np.linalg.norm(par)
+    bad = np.array([par + np.array([0, 0.02 * k, 0]) + 1e-3 * n * (k + 1) for k in range(3)]); bad[:, 2] = np.abs(bad[:, 2]) + 0.001
+    bad /= np.linalg.norm(bad, axis=1, keepdims=True)
+    for name, R_ in (("진짜 경계 + 평행 광선 3개", np.vstack([rays, bad])), ("경계가 전부 평행 광선(점군 껍질로 후퇴)", np.repeat(bad, 5, axis=0))):
+        pb = ls.planar_box(P, boundary_rays=R_)
+        d = pb["dims_sorted"] * 1000
+        check(f"{name}: {d[0]:.0f}x{d[1]:.0f} mm (정답 300x200), 중심 {np.linalg.norm(pb['center'] - C) * 1000:.0f} mm 어긋남, {pb['size_from']}",
+              abs(d[0] - 300) < 12 and abs(d[1] - 200) < 10 and np.linalg.norm(pb["center"] - C) < 0.02)
+
+
+def t_orientation():
+    print("면 회전(yaw/pitch/roll): 정답 회전으로 만든 판에서 부호·값 복원")
+    r, C = np.radians, np.array([0.05, -0.02, 1.5])
+    def orient(ex, ey, **kw):
+        return ls.plane_orientation(C, np.cross(ex, ey), kw.get("long", ex), kw.get("w", 0.3), kw.get("h", 0.2))
+    th = r(20); ex = np.array([np.cos(th), 0, np.sin(th)]); o = orient(ex, [0, 1.0, 0])
+    check(f"오른쪽 끝이 멀어진 20° 판 -> yaw {o['yaw_deg']:+.2f}, pitch {o['pitch_deg']:+.2f}, tilt {o['tilt_deg']:.2f}",
+          abs(o["yaw_deg"] - 20) < 1e-6 and abs(o["pitch_deg"]) < 1e-6 and abs(o["tilt_deg"] - 20) < 1e-6)
+    p = r(15); o = orient(np.array([1.0, 0, 0]), np.array([0, np.cos(p), -np.sin(p)]))
+    check(f"위쪽이 멀어진 15° 판 -> pitch {o['pitch_deg']:+.2f}, yaw {o['yaw_deg']:+.2f}", abs(o["pitch_deg"] - 15) < 1e-6 and abs(o["yaw_deg"]) < 1e-6)
+    f = r(25); o = orient(np.array([np.cos(f), np.sin(f), 0]), np.array([-np.sin(f), np.cos(f), 0]))
+    check(f"광축 둘레 시계 25° -> roll {o['roll_deg']:+.2f}, yaw/pitch {o['yaw_deg']:+.2f}/{o['pitch_deg']:+.2f}",
+          abs(o["roll_deg"] - 25) < 1e-6 and abs(o["yaw_deg"]) < 1e-6 and abs(o["pitch_deg"]) < 1e-6)
+    n = np.cross([np.cos(f), np.sin(f), 0], [-np.sin(f), np.cos(f), 0]); e = np.array([np.cos(f), np.sin(f), 0])
+    a = ls.plane_orientation(C, n, e, 0.3, 0.2); b = ls.plane_orientation(C, -n, -e, 0.3, 0.2)
+    check("법선·긴 변 부호를 뒤집어도 같은 값 (SVD 부호는 임의)", all(abs(a[k] - b[k]) < 1e-6 for k in ("yaw_deg", "pitch_deg", "tilt_deg", "roll_deg")))
+    Ry = lambda a_: np.array([[np.cos(r(a_)), 0, np.sin(r(a_))], [0, 1, 0], [-np.sin(r(a_)), 0, np.cos(r(a_))]])
+    Rz = lambda a_: np.array([[np.cos(r(a_)), -np.sin(r(a_)), 0], [np.sin(r(a_)), np.cos(r(a_)), 0], [0, 0, 1]])
+    R = Ry(-30) @ Rz(25); o = orient(R @ [1, 0, 0], R @ [0, 1, 0])
+    check(f"기울기와 면 안 회전이 섞여도 서로 영향 없음: yaw {o['yaw_deg']:+.2f} (+30), roll {o['roll_deg']:+.2f} (25)",
+          abs(o["yaw_deg"] - 30) < 1e-6 and abs(o["roll_deg"] - 25) < 1e-6)
+    sq = ls.plane_orientation(C, [0, 0, -1.0], [np.cos(r(40)), np.sin(r(40)), 0], 0.2, 0.19)
+    check(f"정사각에 가까우면 roll 을 ±45° 로 접고 roll_ambiguous (40° -> {sq['roll_deg']:+.1f})", sq["roll_ambiguous"] and abs(sq["roll_deg"] + 50) > 0 and -45 < sq["roll_deg"] <= 45)
+    fl = ls.plane_orientation(C, [0, 1.0, 0], [1.0, 0, 0], 0.3, 0.2)
+    check("면이 y축과 나란하면(바닥·천장) roll 은 정의 안 됨(None), tilt 는 나옴", fl["roll_deg"] is None and fl["tilt_deg"] > 80)
 
 
 def _R_to_q(m):
@@ -265,7 +317,7 @@ def t_phone_motion():
 
 
 if __name__ == "__main__":
-    for t in (t_r01, t_r03, t_r05_r07, t_r08, t_r10, t_dense, t_phone_calib, t_phone_motion):
+    for t in (t_r01, t_r03, t_r05_r07, t_r08, t_r10, t_dense, t_outline_guard, t_orientation, t_phone_calib, t_phone_motion):
         try:
             t()
         except Exception as e:

@@ -10,6 +10,8 @@ import time
 import cv2
 import numpy as np
 
+from lib_phone_stereo import LENS_OFFSET_SPAN_MS
+
 
 def load_phone_calibration(path, logical, physical, size):
     """(st, swap). swap=True 면 캘리의 (왼,오른) 이 --physical 의 첫 둘과 반대 — 수신 쌍을 뒤집어 쓴다."""
@@ -75,6 +77,24 @@ def depth_colormap(depth, valid, zmin=0.3, zmax=3.0):
     return out
 
 
+def rotation_between(st, win, tL, tR):
+    """왼쪽 노출 tL, 오른쪽 노출 tR (ns) 사이 폰 회전 -> 렌즈 사이 회전에 곱할 Rg (카메라 프레임). 구간·표본이 없으면 단위행렬.
+
+    X_L(t_R) = Rg X_L(t_L) (평행이동 무시). 기기 프레임 자이로 적분을 Rs 로 카메라 프레임에 옮긴다. tL > tR 이면 역방향.
+    """
+    Rs = st.get("R_sensor_to_left")
+    if Rs is None or tL == tR:
+        return np.eye(3)
+    import lib_phone_motion as pm
+    Rg_dev = pm.gyro_integrated_rotation(win, min(tL, tR), max(tL, tR))          # X_dev(later) = Rg_dev X_dev(earlier)
+    if Rg_dev is None:
+        return np.eye(3)
+    if tL > tR:
+        Rg_dev = Rg_dev.T
+    Rs = np.asarray(Rs, float)
+    return Rs @ Rg_dev @ Rs.T
+
+
 def skew_rotation(st, imu):
     """두 렌즈 노출 시각 사이 폰 회전(자이로 적분) → 이 쌍에 쓸 R' = R · Rg.
 
@@ -87,29 +107,56 @@ def skew_rotation(st, imu):
     Rs = st.get("R_sensor_to_left")
     if len(win) < 2 or not ts or Rs is None or ts[0] == ts[1]:
         return np.eye(3), 0.0
-    import lib_phone_motion as pm
-    tL, tR = int(ts[0]), int(ts[1])
-    Rg_dev = pm.gyro_integrated_rotation(win, min(tL, tR), max(tL, tR))          # X_dev(later) = Rg_dev X_dev(earlier)
-    if Rg_dev is None:
-        return np.eye(3), 0.0
-    if tL > tR:                                                                  # 왼쪽이 나중이면 방향 반대
-        Rg_dev = Rg_dev.T
-    Rs = np.asarray(Rs, float)
-    Rg = Rs @ Rg_dev @ Rs.T
+    Rg = rotation_between(st, win, int(ts[0]), int(ts[1]))
     return Rg, float(np.degrees(np.arccos(np.clip((np.trace(Rg) - 1) / 2, -1, 1))))
 
 
-def motion_px(imu, f_px):
-    """노출 + 롤링셔터 읽기 동안 폰 회전으로 상이 움직인 양(px) = |ω|·(노출 + 롤링셔터 skew)·f. 센서 없으면 None.
+OBSERVABLE_RAD_S = 0.05      # 영상 가로축·광축 둘레 각속도가 이 이상이어야 노출 차가 세로 어긋남(dy)으로 보인다 (70 ms 에 f=438px 로 ≥ 1.5 px)
+
+
+def lens_offset_observable(st, imu):
+    """이 순간의 자이로가 렌즈 노출 차를 추정할 만큼 세로 어긋남을 만드나. yaw(세로축 둘레)는 dy 를 만들지 않아 관측 불가."""
+    g, Rs = (imu or {}).get("gyroscope"), st.get("R_sensor_to_left")
+    if not g or Rs is None:
+        return False
+    w = np.asarray(Rs, float) @ np.asarray(g["values"][:3], float)
+    return bool(np.hypot(w[0], w[2]) >= OBSERVABLE_RAD_S)
+
+
+def estimate_lens_offset(st, win, t_ns, nL, nR, f_px, span_ms=None):
+    """HAL 이 두 렌즈에 같은 시각을 보고해도 실제 노출은 어긋나 있다(S25 실측 약 70~78 ms). 그 차 Δt = t_R − t_L (ms, 부호 있음)를
+    영상과 자이로로 추정한다. 렌즈 사이 회전을 R·Rg(Δt) 로 두고 대응점의 Sampson 에피폴라 오차(Cauchy 로버스트 합)를 Δt 에 대해
+    최소화한다 (5 ms 격자 -> 1 ms). Δt 는 센서 두 개가 자유 주행하며 위상이 초당 ~4 ms 흘러 천천히 변한다.
+
+    nL, nR : 원영상 대응점을 각 렌즈의 K·dist 로 정규화한 좌표. win : 기기 프레임 자이로 [(ts_ns, [wx, wy, wz]), …].
+    반환 (dt_ms, cost(Δt=0), cost(Δt)). 실데이터: 폰을 0.13 rad/s 로 움직이던 쌍 dy 4.40 -> 0.49 px.
+    """
+    import lib_stereo as ls
+    span = LENS_OFFSET_SPAN_MS if span_ms is None else span_ms
+    R0, T0 = np.asarray(st["R"], float), np.asarray(st["T"], float)
+
+    def cost(dt_ms):
+        Rg = rotation_between(st, win, int(t_ns), int(t_ns) + int(dt_ms * 1e6))
+        return float(np.sum(np.log1p((ls.epipolar_sampson(nL, nR, R0 @ Rg, T0) * f_px) ** 2)))
+    best = min(np.arange(-span, span + 1, 5.0), key=cost)
+    best = min(np.arange(best - 4, best + 5, 1.0), key=cost)
+    return float(best), cost(0.0), cost(best)
+
+
+def motion_px(imu, f_px, extra_ms=0.0):
+    """노출 + 롤링셔터 읽기 동안 폰 회전으로 상이 움직인 양(px) = |ω|·(노출 + 롤링셔터 skew + extra)·f. 센서 없으면 None.
 
     frame_timing 값 = [물리별 오프셋 ms…, 노출 ms, 프레임 주기 ms, 롤링셔터 skew ms] (lib_phone_stereo.SENSOR_FRAME_TIMING).
+    extra_ms : 보상되지 않은 두 렌즈 노출 차 (시각이 같게 보고돼 차를 아직 모르면 프레임 주기, 추정 뒤엔 추정 오차).
     """
     g, ft = (imu or {}).get("gyroscope"), (imu or {}).get("frame_timing")
     if not g or not ft or len(ft["values"]) < 3:
         return None
     w = float(np.linalg.norm(np.asarray(g["values"][:3], float)))
-    return w * (float(ft["values"][-3]) + float(ft["values"][-1])) * 1e-3 * f_px
+    return w * (float(ft["values"][-3]) + float(ft["values"][-1]) + extra_ms) * 1e-3 * f_px
 
+
+EPI_FAIL_PX = 3.0     # 이 이상이면 다른 폰 캘리 등 명백한 오류 -> 중단 (1~3px 는 경고만)
 
 class PhoneDepth:
     def __init__(self, a):
@@ -126,7 +173,37 @@ class PhoneDepth:
             self.focus_warning = f"focus_mismatch:calib {st['focus_m']}m vs run {a.focus_m}m"
         self.model = None
         self.ep, self.ep_samples, self.ep_need = None, [], 3      # 정류 판정: 질감 있는 쌍 3개 중앙값 (check_rectification)
+        self.lens_dt_ms = None                                     # 추정한 두 렌즈 실제 노출 차 (시각이 같게 보고될 때만 쓴다)
         self.rgbd_snapshot = None
+
+    def _unknown_timing_rotation(self, fL, fR, imu):
+        """HAL 이 두 렌즈에 같은 시각을 보고하는 상태 (S25 가 재시작 뒤 그렇게 보고: phys2=0 phys5=0, 실제론 ~70 ms 어긋남).
+
+        자이로가 영상 세로 어긋남을 만들 만큼 클 때(lens_offset_observable) 대응점으로 Δt 를 새로 추정해 0.5 씩 섞어 이어 쓰고,
+        작을 땐 이전 추정을 그대로 쓴다 (노출 차는 천천히 변하고, 자이로가 작으면 어차피 보상량이 작다). 반환 (Rg, deg, 추정했나).
+        """
+        g = (imu or {}).get("gyroscope")
+        if not g or self.st.get("R_sensor_to_left") is None:
+            return np.eye(3), 0.0, False
+        import lib_stereo as ls
+        t = int(imu["exposure_ts_ns"][0])
+        span = int(LENS_OFFSET_SPAN_MS * 1e6)
+        win = imu.get("gyro_window") or []
+        if len(win) < 2:                                           # 오프라인 번들 등: 그 순간 자이로를 창 전체에 (상수 각속도 근사)
+            win = [(t - span, list(g["values"][:3])), (t + span, list(g["values"][:3]))]
+        estimated = False
+        if lens_offset_observable(self.st, imu):
+            pL, pR, _ = ls._match_sift(cv2.cvtColor(fL.bgr, cv2.COLOR_BGR2GRAY), cv2.cvtColor(fR.bgr, cv2.COLOR_BGR2GRAY), None, 0.75)
+            if len(pL) >= 30:
+                nL = ls._to_normalized(pL, np.asarray(self.st["K1"], float), np.asarray(self.st["dist1"], float))
+                nR = ls._to_normalized(pR, np.asarray(self.st["K2"], float), np.asarray(self.st["dist2"], float))
+                dt, _, _ = estimate_lens_offset(self.st, win, t, nL, nR, float(self.st["K1"][0][0]))
+                self.lens_dt_ms = dt if self.lens_dt_ms is None else 0.5 * (self.lens_dt_ms + dt)
+                estimated = True
+        if self.lens_dt_ms is None:
+            return np.eye(3), 0.0, False
+        Rg = rotation_between(self.st, win, t, t + int(self.lens_dt_ms * 1e6))
+        return Rg, float(np.degrees(np.arccos(np.clip((np.trace(Rg) - 1) / 2, -1, 1)))), estimated
 
     def check_rectification(self, left, right, motion_px=None):
         """정류 dy 검사. 질감 있는 쌍 ep_need 개의 중앙값으로 한 번 판정하고, 판정 후에는 다시 보지 않는다.
@@ -158,8 +235,10 @@ class PhoneDepth:
         inl = float(np.median([e["inlier_frac"] for e in self.ep_samples]))
         self.ep = dict(ep, dy_med=dy, inlier_frac=inl, n_pairs=len(self.ep_samples),
                        dy_med_pairs=[round(e["dy_med"], 3) for e in self.ep_samples])
-        if dy >= od.EPI_GATE_PX or inl < od.EPI_INLIER_FRAC:
+        if dy >= EPI_FAIL_PX or inl < od.EPI_INLIER_FRAC:
             raise ValueError(f"Phone rectification failed: {self.ep}")
+        if dy >= od.EPI_GATE_PX:       # 1~3px 로 일관되게 어긋남: 캘리가 틀린 게 아니라 초점·노출차·온도 등 작은 편차. 멈추지 않고 경고
+            self.ep["marginal"] = True
 
     def __call__(self, pair, imu=None):
         import lib_ffs
@@ -180,13 +259,21 @@ class PhoneDepth:
             imu.update(sensors)
         # 동기 어긋남(두 노출 시각 차) 동안의 폰 회전을 자이로로 보상: 0.02° 넘으면 이 쌍만 정류 테이블을 다시 만든다 (~10ms)
         Rg, skew_deg = skew_rotation(self.st, imu)
+        ts = (imu or {}).get("exposure_ts_ns")
+        unknown_timing = bool(ts) and ts[0] == ts[1]                # 두 렌즈 실제 노출은 같을 수 없다 -> 시각을 모른다는 뜻
+        offset_estimated = False
+        if unknown_timing:
+            Rg, skew_deg, offset_estimated = self._unknown_timing_rotation(fL, fR, imu)
         if skew_deg > 0.02:
             rp = lr.rectify_maps(*self.cal, np.asarray(self.st["R"]) @ Rg, np.asarray(self.st["T"]))
         else:
             rp = self.rp0
         self.rp = rp
         left, right = lr.rectify_pair(fL.bgr, fR.bgr, rp)
-        self.check_rectification(left, right, motion_px(imu, rp["f"]))
+        ft = ((imu or {}).get("frame_timing") or {}).get("values")
+        period = float(ft[-2]) if ft and len(ft) >= 3 else 66.67
+        extra_ms = (0.0 if not unknown_timing else (8.0 if self.lens_dt_ms is not None else period))     # 추정 오차 / 차를 아직 모름(최악 = 한 프레임 주기)
+        self.check_rectification(left, right, motion_px(imu, rp["f"], extra_ms))
         if self.model is None:
             self.model = lib_ffs.load(valid_iters=a.iters)
         disp = lib_ffs.infer(self.model, cv2.cvtColor(left, cv2.COLOR_BGR2RGB),
@@ -195,6 +282,9 @@ class PhoneDepth:
         points = lr.depth_to_points_cam1(np.where(valid, depth, np.nan).astype(np.float32), rp)
         mode = a.yolo if a.yolo != "none" else "both"
         dets = ld.detect_yolo(left, model=ld.DEFAULT_MODEL if mode == "bbox" else ld.DEFAULT_SEG_MODEL, device="0")
+        if getattr(a, "blobs", True):      # YOLO 가 모르는 물체(큐브 등): 평면 위로 튀어나온 덩어리
+            import lib_blobs
+            dets = dets + lib_blobs.detect_blobs(disp, valid, depth, rp["f"], existing=dets)
         gf = gravity_frame(self.st, imu)
         overlays, results = [], {}
         for method in (["seg", "bbox"] if mode == "both" else [mode]):
@@ -205,6 +295,8 @@ class PhoneDepth:
                     rec["warnings"].append("scale_not_validated:" + str(self.st.get("scale_status")))
                 if self.ep["status"] != "ok":
                     rec["warnings"].append("rectification_unverified")
+                elif self.ep.get("marginal"):
+                    rec["warnings"].append(f"rectification_marginal:dy{self.ep['dy_med']:.2f}px")
                 if self.focus_warning:
                     rec["warnings"].append(self.focus_warning)
                 if method == "seg":
@@ -233,7 +325,9 @@ class PhoneDepth:
         zr = getattr(a, "depth_range", None) or (0.3, 3.0)
         overlays.append(depth_colormap(depth, valid, float(zr[0]), float(zr[1])))
         report = dict(timestamp_ns=[fL.timestamp_ns, fR.timestamp_ns], physical_lr=self.st["phone"]["physical"],
-                      exposure_skew_ms=(fR.timestamp_ns - fL.timestamp_ns) / 1e6, gyro_skew_compensation_deg=round(skew_deg, 4), motion_px=motion_px(imu, rp["f"]),
+                      exposure_skew_ms=(fR.timestamp_ns - fL.timestamp_ns) / 1e6, gyro_skew_compensation_deg=round(skew_deg, 4), motion_px=motion_px(imu, rp["f"], extra_ms),
+                      lens_timing=("unknown" if unknown_timing else "reported"),
+                      lens_offset_ms=(None if self.lens_dt_ms is None else round(self.lens_dt_ms, 1)), lens_offset_estimated=offset_estimated,
                       mode=mode, device="cuda:0",
                       imu={k: v for k, v in (gf or {}).items() if k != "R_cam1_to_world"} if gf else dict(available=False),
                       imu_raw={k: v for k, v in (imu or {}).items() if k != "gravity"},

@@ -391,6 +391,7 @@ def main(a):
 if __name__ == "__main__":
     os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--no-blobs", dest="blobs", action="store_false", help="깊이 기반 클래스 무관 검출(큐브 등) 끄기")
     ap.add_argument("--rgbd-viewer", action="store_true", help="RGB / depth / interactive scene point cloud / IMU dashboard")
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--list", action="store_true")

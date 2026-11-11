@@ -16,7 +16,7 @@
   --yolo seg --rgbd-viewer --out phone_stereo/runs/my_view
 ```
 
-- `--yolo seg`: 객체 인식·세그멘테이션 및 객체별 깊이 추출.
+- `--yolo seg`: 객체 인식·세그멘테이션 및 객체별 깊이·크기·**카메라 기준 회전(yaw/pitch/roll, 라벨 아래 노란 글자)** 추출. 의미·정확도는 [phone_stereo/README.md](phone_stereo/README.md#객체-회전-yaw--pitch--roll).
 - `--rgbd-viewer`: RGB·깊이·3D 점군·IMU 표시.
 - `--out`: 실행 결과 저장 폴더.
 

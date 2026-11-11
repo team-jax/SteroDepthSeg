@@ -114,7 +114,7 @@ def _empty(label, instance, det, method):
                 warnings=[], region_count=0, valid_count=0, valid_fraction=0.0, selected_count=0,
                 selected_fraction=None, depth_raw_m=None, depth_rect_m=None, z_cam1_med_m=None,
                 dist_m=None, p10_m=None, p90_m=None, mad_m=None, mixed_depth=None,
-                center_cam1_m=None, center_map_m=None, dims_mm=None, size_status=None,
+                center_cam1_m=None, center_map_m=None, dims_mm=None, size_status=None, rotation=None,
                 planarity=None, selection_policy=None, depth_clusters=None, minority_fraction=None,
                 coordinate_frame="cam1(원 카메라1 광학계) / map(Z-up)")
 
@@ -186,7 +186,7 @@ def aggregate(rec, region, valid, Z, pts_cam1, rp=None, outline=False):
         keep = lab == pick
         if keep.sum() < 50:
             rec["status"] = "insufficient_valid_pixels"; return rec
-        z_raw, P = z_raw[keep], P[keep]
+        z_raw, P, uu, vv = z_raw[keep], P[keep], uu[keep], vv[keep]
         # 선택되지 않은 쪽이 작지 않으면 물체를 확정할 수 없다 -> ambiguous
         rec["minority_fraction"] = float(1.0 - keep.mean())
     else:
@@ -214,6 +214,10 @@ def aggregate(rec, region, valid, Z, pts_cam1, rp=None, outline=False):
     if pb["planar_ok"]:
         rec.update(dims_mm=(pb["dims_sorted"] * 1000).round(1).tolist(),
                    size_status=f"planar+{pb['size_from']}")
+        # 회전: 법선은 시차 평면 최소제곱으로 (SVD 법선은 깊이 노이즈에 편향). rp 가 없으면(bbox 단독 호출) SVD 법선.
+        nrm = lr.fit_plane_disparity(uu[idx], vv[idx], rp["f"] * rp["baseline_m"] / zs, rp) if rp is not None else None
+        rot = ls.plane_orientation(pb["center"], pb["normal"] if nrm is None else nrm, pb["long_axis"], *pb["dims_sorted"][:2])
+        rec["rotation"] = dict(rot, normal_source="disparity-plane" if nrm is not None else "svd-points")
     else:
         rec.update(dims_mm=None, size_status="non_planar"); rec["warnings"].append("non_planar")
     # seg: 마스크 안 소수 군집 20% 초과면 혼입/가림 의심.
@@ -230,6 +234,15 @@ def aggregate(rec, region, valid, Z, pts_cam1, rp=None, outline=False):
     return rec
 
 
+def rotation_text(rot):
+    """화면용 한 줄 (putText 는 한글 불가). 기호 정의는 lib_stereo.plane_orientation.
+    yaw + = 오른쪽 끝이 멂, pitch + = 위쪽이 멂, roll + = 영상에서 시계 방향. roll ~ = 정사각에 가까워 접힌 값."""
+    if not rot:
+        return None
+    roll = "roll --" if rot["roll_deg"] is None else f"roll {'~' if rot['roll_ambiguous'] else ''}{rot['roll_deg']:+.0f}"
+    return f"yaw {rot['yaw_deg']:+.0f} pitch {rot['pitch_deg']:+.0f} {roll}"
+
+
 def draw_overlay(rect_bgr, dets, results, mode):
     vis = ld.draw(rect_bgr, dets, color=(0, 220, 80) if mode != "bbox" else (255, 160, 0))
     for d, r in zip(dets, results):
@@ -238,9 +251,12 @@ def draw_overlay(rect_bgr, dets, results, mode):
              if r["status"] in ("ok", "ambiguous") else r["status"])
         if r["status"] == "ambiguous":
             t += " ?"
-        yy = min(rect_bgr.shape[0] - 6, y + h + 16)
-        cv2.putText(vis, t, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-        cv2.putText(vis, t, (x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        yy = min(rect_bgr.shape[0] - 24, y + h + 16)                 # 아래 한 줄(회전)을 위해 여유 8px 더
+        lines = [ln for ln in (t, rotation_text(r.get("rotation"))) if ln]
+        xx = int(np.clip(x, 0, max(0, rect_bgr.shape[1] - 4 - max(cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0] for ln in lines))))
+        for k, line in enumerate(lines):                              # 물체가 화면 가장자리에 있어도 글자가 잘리지 않게 안쪽으로 민다
+            cv2.putText(vis, line, (xx, yy + 16 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+            cv2.putText(vis, line, (xx, yy + 16 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255) if k == 0 else (120, 230, 255), 1)
     return vis
 
 
@@ -339,6 +355,11 @@ def main(a):
     model_name = a.model or (ld.DEFAULT_SEG_MODEL if seg else ld.DEFAULT_MODEL)
     dets = ld.detect_yolo(rL, model=model_name, conf=a.conf, classes=a.classes, device=a.device)
     print(f"YOLO({model_name}, {getattr(ld.detect_yolo, 'last_device', '?')}) 검출 {len(dets)}개")
+    if a.blobs:
+        import lib_blobs
+        extra = lib_blobs.detect_blobs(disp, valid, Z, rp["f"], existing=dets)
+        print(f"깊이 덩어리(클래스 무관) 검출 {len(extra)}개")
+        dets = dets + extra
 
     # ── 집계 ─────────────────────────────────────────────────────────────────
     H, W = disp.shape
@@ -361,14 +382,15 @@ def main(a):
 
     # ── 출력 ─────────────────────────────────────────────────────────────────
     print(f"\n{'='*78}\n{'#':>2s} {'label':12s} {'meth':4s} {'status':10s} {'Zrect':>6s} {'dist':>6s} "
-          f"{'p10~p90':>13s} {'val':>4s} {'sel':>4s} {'크기 mm (W x H x 두께)':>22s}\n{'='*78}")
+          f"{'p10~p90':>13s} {'val':>4s} {'sel':>4s} {'크기 mm (W x H x 두께)':>22s}  회전°\n{'='*78}")
     for m, rows in results.items():
         for r in rows:
             if r["status"] not in ("ok", "ambiguous"):
                 print(f"{r['instance']:>2} {r['label']:12s} {m:4s} {r['status']}"); continue
             dims = r["dims_mm"]; ds = " x ".join(f"{v:.0f}" for v in dims) if dims else f"-({r['size_status']})"
             print(f"{r['instance']:>2} {r['label']:12s} {m:4s} {r['status']:10s} {r['depth_rect_m']:6.3f} {r['dist_m']:6.3f} "
-                  f"{r['p10_m']:6.3f}~{r['p90_m']:6.3f} {r['valid_fraction']*100:3.0f}% {r['selected_fraction']*100:3.0f}% {ds:>22s}")
+                  f"{r['p10_m']:6.3f}~{r['p90_m']:6.3f} {r['valid_fraction']*100:3.0f}% {r['selected_fraction']*100:3.0f}% {ds:>22s}  "
+                  f"{rotation_text(r.get('rotation')) or '-'}")
     if a.known_m:
         for m, rows in results.items():
             for r in rows:
@@ -408,6 +430,7 @@ if __name__ == "__main__":
     ap.add_argument("--z-range", type=float, nargs=2, default=(0.1, 20.0), metavar=("MIN", "MAX"))
     ap.add_argument("--model", help="YOLO 가중치 (기본: seg 면 yolo11m-seg.pt, bbox 면 yolo11m.pt)")
     ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--blobs", action="store_true", help="YOLO 가 모르는 물체를 평면 위로 튀어나온 덩어리로 추가 검출")
     ap.add_argument("--classes", nargs="+")
     ap.add_argument("--device", default=None)
     ap.add_argument("--known-m", type=float, help="객체 하나의 실측 거리(m) — 검증용")

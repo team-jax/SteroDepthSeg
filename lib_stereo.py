@@ -442,6 +442,7 @@ def planar_box(pts, min_pts=20, mad_k=3.0, boundary_rays=None, max_thick_ratio=0
     반환: dict(center, dims_sorted=[W,H,thick], normal, n, size_from, idx, planarity,
                planar_ok) 또는 None
       idx : 입력 pts 기준 최종 사용 점의 인덱스. 거리·중심·치수를 같은 집합에서 내기 위함.
+      normal / long_axis : 적합 평면의 법선(부호 임의)과 minAreaRect 긴 변 방향 — plane_orientation 입력.
     """
     P0 = np.asarray(pts, np.float64)
     fin = np.isfinite(P0).all(axis=1)
@@ -484,19 +485,62 @@ def planar_box(pts, min_pts=20, mad_k=3.0, boundary_rays=None, max_thick_ratio=0
         ok &= s_ > 0
         if ok.sum() >= 8:
             Q = d[ok] * s_[ok, None]                     # 경계 광선 ∩ 평면
-            size_from = "mask-outline"
+            # 경계 화소는 물체 점들과 같은 영역의 가장자리라 교점 깊이가 점들의 깊이 범위 근처여야 한다. 면과 거의 평행한 광선은
+            # 교점이 수십 m 로 튀어 폭·중심을 망가뜨린다(합성: 평행 광선 3개로 300 -> 1168 mm). 범위(±(절반 폭 + 2%)) 밖은 버린다.
+            zlo, zhi = np.percentile(P[:, 2], [2, 98])
+            m = 0.5 * (zhi - zlo) + 0.02 * abs(zm)
+            near = (Q[:, 2] >= zlo - m) & (Q[:, 2] <= zhi + m)
+            if near.sum() >= 8:
+                Q = Q[near]
+                size_from = "mask-outline"
+            else:
+                Q = P                                    # 쓸 만한 경계 교점이 없으면 점군 껍질로
     uv = np.column_stack([(Q - c) @ e1, (Q - c) @ e2]).astype(np.float32)
-    (rx, ry), (w, h), _ = cv2.minAreaRect(uv)
+    rect = cv2.minAreaRect(uv)
+    (rx, ry), (w, h), _ = rect
     center = c + rx * e1 + ry * e2
+    bp = cv2.boxPoints(rect)                              # 사각형 긴 변 방향 (roll 계산용) — 평면 2D -> 3D
+    edge = max(bp[1] - bp[0], bp[2] - bp[1], key=np.linalg.norm)
+    long_axis = (edge[0] * e1 + edge[1] * e2) / max(float(np.linalg.norm(edge)), 1e-12)
     dims = np.array(sorted([float(w), float(h)], reverse=True) + [thick])
     # 평면성: 법선 방향 강건 폭 / 짧은 변. p2~p98 폭은 깊이 노이즈 꼬리에 부풀어 작은 물체
     # (폰, 짧은 변 100mm, 노이즈 1%@1.5m -> 꼬리 폭 46mm) 를 비평면으로 오판했다.
     ratio = robust_w / max(min(float(w), float(h)), 1e-6)
-    return dict(center=center, dims_sorted=dims, normal=n, n=int(len(P)), size_from=size_from,
+    return dict(center=center, dims_sorted=dims, normal=n, long_axis=long_axis, n=int(len(P)), size_from=size_from,
                 idx=idx,
                 planarity=dict(thick_m=thick, robust_width_m=robust_w, ratio=float(ratio), rms_m=rms,
                                n_in=int(fin.sum()), n_used=int(len(P))),
                 planar_ok=bool(ratio < max_thick_ratio))
+
+
+def plane_orientation(center, normal, long_axis, w, h):
+    """보이는 면이 카메라에 대해 얼마나 돌아가 있나 (카메라 좌표계: x 오른쪽, y 아래, z 앞).
+
+    n = 카메라를 향하게 부호를 맞춘 법선 (SVD 법선은 부호가 임의다). 정면으로 마주 보면 n = (0, 0, -1).
+      yaw   = atan2(n_x, -n_z)   : + = 면의 오른쪽 끝이 더 멀다 (왼쪽을 보고 돌아선 것), - = 왼쪽 끝이 더 멀다
+      pitch = atan2(-n_y, -n_z)  : + = 면의 위쪽이 더 멀다 (뒤로 젖혀짐),             - = 아래쪽이 더 멀다
+      tilt  = acos(-n_z)         : 면과 영상 평면 사이 각 (0 = 정면). yaw·pitch 는 x·y 방향 경사각이라 둘이 크면 tilt 와 다르다
+      roll  = 면 안에서 긴 변이 가로(면의 수평 방향)에서 돌아간 각, + = 영상에서 시계 방향, (-90, 90].
+              h = n x y축 (면 안의 수평), v = h x n. 정사각에 가까우면(짧은/긴 변 > 0.9) 긴 변이 불안정해
+              roll 을 (-45, 45] 로 접고 roll_ambiguous=True. 면이 바닥·천장처럼 y축과 나란하면 roll=None.
+    숫자 검증: 20° 돌린 판 -> yaw +20, 위가 15° 멀어진 판 -> pitch +15, 광축 둘레 25° -> roll +25,
+    법선·긴 변 부호를 뒤집어도 같은 값 (z_selftest t_orientation).
+    """
+    n = np.asarray(normal, np.float64); n = n / np.linalg.norm(n)
+    if n @ np.asarray(center, np.float64) > 0:
+        n = -n
+    out = dict(yaw_deg=float(np.degrees(np.arctan2(n[0], -n[2]))), pitch_deg=float(np.degrees(np.arctan2(-n[1], -n[2]))),
+               tilt_deg=float(np.degrees(np.arccos(np.clip(-n[2], -1.0, 1.0)))), roll_deg=None, roll_ambiguous=False,
+               normal_cam1=n.round(4).tolist())
+    hx = np.cross(n, [0.0, 1.0, 0.0])
+    if np.linalg.norm(hx) < 0.1:
+        return out
+    hx /= np.linalg.norm(hx); vx = np.cross(hx, n)
+    e = np.asarray(long_axis, np.float64)
+    a = float(np.degrees(np.arctan2(e @ vx, e @ hx)))          # (hx, vx) 는 면 위 기저라 e 의 면 밖 성분은 자동으로 버려진다
+    amb = bool(min(w, h) / max(max(w, h), 1e-9) > 0.9)
+    out.update(roll_deg=((a + 45.0) % 90.0 - 45.0) if amb else ((a + 90.0) % 180.0 - 90.0), roll_ambiguous=amb)
+    return out
 
 
 def check_pure_translation(imgL, imgR, calib, ratio=0.75):

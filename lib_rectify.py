@@ -107,6 +107,35 @@ def depth_to_points_cam1(depth, rp):
     return pts @ np.asarray(rp["R1"], np.float32)      # (R1^T @ p)^T = p^T @ R1
 
 
+def fit_plane_disparity(u, v, disp, rp, iters=3, clip=3.0):
+    """정류 영상의 화소 (u, v) 와 시차 d 로 평면 법선을 구한다 -> 원 카메라1 좌표계 단위 법선 (부호 임의) 또는 None.
+
+    정류 좌표에서 평면 n·X = k 는 시차에서 정확히 선형이다: d = A u + B v + C, 그리고
+      n ∝ (A, B, (C + A cx + B cy) / f)   (정류 좌표) -> R1^T 로 카메라1 좌표.
+    (u, v) 는 오차가 없는 화소 좌표이고 오차는 d 에만 있으므로 최소제곱이 편향 없다. 3D 점에 SVD(전최소제곱)를 쓰면
+    오차가 깊이 방향에만 있을 때 법선이 시선 쪽으로 치우친다 (합성 20° 판: 깊이 노이즈 2% 에서 +2.6°, 0.5% 에서 +0.15°).
+    `clip`·MAD 로 이상치를 두 번 걷어 낸다.
+    """
+    u, v, d = (np.asarray(a, np.float64).ravel() for a in (u, v, disp))
+    ok = np.isfinite(d) & (d > 0)
+    if ok.sum() < 20:
+        return None
+    X = np.column_stack([u - rp["cx"], v - rp["cy"], np.ones_like(u)])[ok]      # 중심 기준으로 두어 조건수를 낮춘다
+    y, w = d[ok], np.ones(int(ok.sum()), bool)
+    for _ in range(iters):
+        coef, *_ = np.linalg.lstsq(X[w], y[w], rcond=None)
+        r = y - X @ coef
+        s = 1.4826 * np.median(np.abs(r[w] - np.median(r[w])))
+        w_new = np.abs(r) <= clip * max(s, 1e-3)
+        if w_new.sum() < 20 or (w_new == w).all():
+            break
+        w = w_new
+    A, B, C = coef                                          # d = A (u-cx) + B (v-cy) + C
+    n = np.array([A, B, C / rp["f"]])
+    nn = np.linalg.norm(n)
+    return None if nn < 1e-12 else (np.asarray(rp["R1"], np.float64).T @ (n / nn))
+
+
 def pixel_rays_cam1(rp, uv):
     """정류-왼쪽 화소 (M,2) -> 원 카메라1 좌표계의 광선 방향 (M,3)."""
     uv = np.asarray(uv, np.float64).reshape(-1, 2)

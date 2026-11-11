@@ -2,6 +2,24 @@
 
 최종 갱신: 2026-10-25
 
+## 2026-11-05: 라이브 `Phone rectification failed` 재발 — 폰 HAL 이 두 렌즈 노출 시각을 같게 보고
+
+- 증상: 라이브 실행이 `dy_med_pairs [2.564, 0.862, 4.963]` 로 멈춤. 저장된 마지막 쌍 dy 4.40 px, 인라이어 1% (정지 장면 칼리브레이션 확인은 7쌍 0.25~0.55 px 로 정상).
+- 원인: 폰이 재시작된(uptime 52 분) 뒤 카메라 HAL 이 `RESULT … phys2=0 phys5=0` — 두 렌즈 물리 `SENSOR_TIMESTAMP` 를 논리값과 같게 보고(5회 반복 시험 전부). 쌍 timestamp 가 정확히 같고 `skew_median_ms 0.0`. 실제 노출은 여전히 어긋남: 자이로 0.128 rad/s × 4.40 px/438 px → **78 ms** (10-22 실측 광각 지연 60~90 ms 와 일치). 코드의 시각 기반 자이로 보상(`skew_rotation`)이 아무것도 못 하고 있었다.
+- 수정(`lib_phone_depth`·`lib_phone_stereo`): 시각이 같게 보고되면 자이로 창 ±100 ms 를 받고(`imu_for_pair`), **영상 대응점 + 자이로로 노출 차를 추정**(`estimate_lens_offset`, Sampson 오차 최소화, 5 → 1 ms 격자)해 `R·Rg(Δt)` 로 정류. 영상 가로축·광축 각속도 ≥ 0.05 rad/s 일 때만 새로 추정(`lens_offset_observable`), 아니면 직전 값 유지(0.5 섞기). 판정용 `motion_px` 에는 보상 안 된 노출 차(차를 모르면 프레임 주기 66.7 ms, 추정 뒤 8 ms)를 더함. 보고서에 `lens_timing`, `lens_offset_ms`, `lens_offset_estimated`.
+- 검증: 실제 실패 쌍에서 Δt 72 ms 추정, dy 4.40 → 0.49 px, 인라이어 0.01 → 0.92, 객체 거리도 정상화(노트북 키보드 0.12 m/35 m → 0.38 m, 사람 0.34 → 2.4 m). 합성 단위 테스트(참 Δt 78/55/−40/20 ms, 오차 < 3 ms), 관측 가능 조건, 폰 실기 25초 무오류(추론 54회 중앙값 202 ms).
+- 같이 고친 것: `planar_box` 경계 광선 ∩ 평면에서 면과 거의 평행한 광선이 수십 m 로 튀어 폭·중심이 망가짐(합성: 평행 광선 3개로 300 → 1168 mm; 실제 출력 `dims_mm 70689`, `dist_m 35`). 교점 깊이가 물체 점 깊이 범위(± 절반 폭 + 2%)를 벗어나면 버리고, 남은 게 8개 미만이면 점군 껍질로 후퇴. 회귀 테스트 `t_outline_guard`.
+- 못 고친 것: 반복 무늬(천장 타일)에서 판정이 가짜 대응점으로 오판할 수 있음 (phone_stereo/README). 노출 차 추정은 회전만 보상(평행이동 불가), 실제 움직이는 폰에서의 연속 동작은 한 쌍으로만 검증.
+- 테스트: z_selftest 42, 폰 unittest 24.
+
+## 2026-11-05: 객체 회전(yaw/pitch/roll) 표시 추가
+
+- 요청: 물체가 카메라 기준으로 얼마나 회전했는지 화면에 표시. `planar_box` 가 법선을 이미 계산하지만 결과·화면에 안 쓰고 있었다.
+- 추가: `lib_stereo.plane_orientation`(yaw/pitch/tilt/roll 정의, 숫자 검증 7건), `lib_rectify.fit_plane_disparity`(시차 평면 최소제곱 법선), `planar_box` 반환에 `long_axis`, `z_object_depth.aggregate` 가 `rec["rotation"]` 기록, `draw_overlay`·결과 표에 `yaw/pitch/roll` 표시(글자가 화면 밖으로 안 잘리게 보정). 라이브·`--offline`·RGB-D 뷰어 공통(`PhoneDepth` 가 같은 함수 사용).
+- **SVD 법선은 쓰지 않는다**: 합성 20° 판에서 깊이 노이즈 0.5/1/2% → yaw +20.15/+20.60/+22.58° (편향, 전최소제곱의 알려진 문제). 시차 평면은 20.15/20.15/20.65°.
+- 실데이터 검증: S25 보드 39장 vs solvePnP — pitch 0.5°, roll 0.3°, yaw 1.7°(−1.4° 치우침), tilt 1.1° (평균 절대오차). 작은 물체·먼 거리·기울기 > 26° 는 미검증.
+- 테스트: z_selftest 31 → 40항목(회전 정의 7 + 조밀 회전 2) 통과, 폰 unittest 21개.
+
 ## 현재 상태 요약 (2026-10-25)
 
 - **전체 목표(현재)**: 폰 후면 두 렌즈(Galaxy S25 초광각 2 + 광각 5) 스테레오 → PC 에서 FFS 조밀 깊이 + YOLO seg 로 객체별 거리·3D·크기, RGB-D·IMU 뷰어. 진입점 `z_phone_stereo.py` (README.md).
