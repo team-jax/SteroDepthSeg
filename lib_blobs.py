@@ -67,6 +67,15 @@ def detect_blobs(disp, valid, depth, f_px, existing=(), min_px=120, size_m=(0.01
         if area < min_px or area > max_frac * H * W:
             continue
         reg = lab == i
+        # 유효 시차 영역의 가장자리(정류 ROI 경계·화면 끝)에 붙은 조각은 실제 물체가 아니라 시차 가장자리 아티팩트다
+        # (실측: 화면 모서리의 얇은 삼각형이 blob 으로 잡혔다). 주변 고리의 무효 화소 비율로 거른다.
+        x0, y0, x1, y1 = max(0, x - 8), max(0, y - 8), min(W, x + w + 8), min(H, y + h + 8)
+        ring = cv2.dilate(reg[y0:y1, x0:x1].astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+        ring &= ~reg[y0:y1, x0:x1]
+        pad = (x0 == 0) + (y0 == 0) + (x1 == W) + (y1 == H)
+        bad = (~valid[y0:y1, x0:x1])[ring].mean() if ring.any() else 1.0
+        if bad > 0.25 or (pad and (x < 8 or y < 8 or x + w > W - 8 or y + h > H - 8)):
+            continue
         z = float(np.median(depth[reg & valid]))
         if not np.isfinite(z):
             continue
