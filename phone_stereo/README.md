@@ -107,6 +107,32 @@ RGB 화면의 객체 라벨 아래 줄(노란 글자)에 카메라 기준 회전
 - **전제**: 보이는 면이 **하나의 평면**일 때만 계산한다 (`planar_ok`). 병·구·여러 면이 보이는 물체는 `rotation: null`(화면에 회전 줄 없음). 크기가 `non_planar` 인 객체가 그렇다.
 - **정확도 (측정)**: S25 보드 39장(0.39~0.65 m, 기울기 3~26°), 스테레오 vs `solvePnP` — pitch 평균오차 0.5°(최대 1.3°), roll 0.3°(0.9°), yaw 1.7°(최대 4.7°, 약 −1.4° 치우침), tilt 1.1°. 보드(35 cm 폭)처럼 큰 물체 기준이다. **작은 물체·먼 거리에서는 시차 오차가 상대적으로 커져 더 틀린다** (측정 안 함). 이 범위 밖(기울기 > 26°)은 검증하지 못했다.
 
+## 평면 법선 vs 중력 방향 (자세 3개로 캘리·정류 검증)
+
+책상 같은 수평면이 화면의 30% 이상을 차지할 때, RANSAC 평면 법선(`lib_blobs.fit_dominant_plane`)과 폰 중력 방향
+(`inference.json` 의 `imu.up_cam1`)은 같은 방향이어야 한다. `z_plane_vs_gravity.py` 가 두 벡터 사이 각도(도)를 출력한다.
+각도가 크거나 자세마다 달라지면 캘리(`R_sensor_to_left`)·정류(R1)·시차 평면 중 하나가 틀린 것이다.
+
+```bash
+# 자세마다 폰을 고정하고 따로 실행한다. 6초 이상 가만히 둔 뒤 Q (rgbd 는 5초마다 저장 — inference.json 과 같은 프레임이어야 한다)
+for p in pose1 pose2 pose3; do
+  read -p "폰을 책상 위 새 자세로 고정하고 Enter ($p): "
+  ./venv_ffs/bin/python z_phone_stereo.py --physical 2 5 --calib-stereo calib_phone_pair.json \
+      --yolo seg --rgbd-viewer --out phone_stereo/runs/$p
+done
+
+# 세 자세의 각도
+./venv_ffs/bin/python z_plane_vs_gravity.py phone_stereo/runs/pose1 phone_stereo/runs/pose2 phone_stereo/runs/pose3
+#   pose1: 1.20°  (법선 [...], up [...], 평면 잡음 0.09px)
+#   ...
+#   요약: n=3 평균 ... 범위 ...
+```
+
+- 자세 예: 거의 수직으로 내려다보기 / 45° 기울이기 / 낮게 비스듬히. 책상 면이 화면 대부분이어야 한다.
+- 단일 파일은 `--inference RUN/inference.json --npz RUN/rgbd/rgbd.npz`. 입력은 RUN 안의 깊이(`rgbd/rgbd.npz`)와 `inference.json`.
+- 타임스탬프가 어긋난 쌍(깊이와 imu 가 다른 프레임)은 요약에서 빼고 이유를 출력한다. "지배 평면 없음"이면 평면이 화면에 부족한 것.
+- 합성 평면(기울기 10/35/60°)에서는 0.001° 이하로 나온다(수학 검증). 실기 합격선(몇 도 이내)은 아직 정하지 못했다 — 첫 측정값으로 정한다.
+
 ## 폰 센서 (IMU·기압)
 
 앱이 자이로·중력·선가속도·게임 회전벡터·회전벡터(125 Hz), 기압(12.5 Hz)을 같은 소켓으로 보낸다(magic `SENS`, payload float32). 카메라와 같은 elapsedRealtimeNanos 시계라 프레임 시각의 센서값을 찍어 `pair.json`의 `imu` 와 depth 보고서 `imu`/`imu_raw` 에 넣는다. `summary.json` 의 `imu` 에 센서별 표본수·주기, `clock_gap_ms` 에 시계 일치 확인값이 있다.
