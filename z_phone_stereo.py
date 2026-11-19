@@ -178,27 +178,33 @@ def main(a):
                 return
             time.sleep(.1)
         raise TimeoutError("Phone inventory failed")
-    adb("forward", "tcp:8765", "tcp:8765")
-    deadline = time.monotonic() + 12
-    sock = None
-    # ADB's forwarded port accepts even before the phone starts listening, so
-    # wait for the Activity's state rather than treating connect() as readiness.
-    while time.monotonic() < deadline:
-        state = adb("shell", "run-as", PACKAGE, "cat", "files/status.txt", check=False).stdout
-        if state.startswith("STREAMING"):
-            sock = socket.create_connection(("127.0.0.1", 8765), timeout=8)
-            break
-        if "from background" in state:
-            raise RuntimeError("폰 화면이 꺼져 있거나 잠겨 있어 앱이 카메라를 열지 못했다. 폰 화면을 켜고 잠금을 푼 뒤 다시 실행할 것 "
-                               "(USB 연결 중 화면 유지: adb shell settings put global stay_on_while_plugged_in 2)\n" + state)
-        if any(s in state for s in ("FAILED", "ERROR", "DISCONNECTED", "STOPPED")):
-            raise RuntimeError(state)
-        time.sleep(.15)
-    if sock is None:
-        raise TimeoutError("Camera startup: " + state)
-    receiver = PhoneReceiver(sock, len(a.physical), a.size, a.max_skew_ms)
-    receiver.start()
+    def open_stream():
+        """adb forward -> 앱이 STREAMING 이 될 때까지 대기 -> 접속 -> 수신 스레드 시작. 처음 연결과 자동 재시작이 같이 쓴다."""
+        adb("forward", "tcp:8765", "tcp:8765")
+        deadline = time.monotonic() + 12
+        sock = None
+        # ADB's forwarded port accepts even before the phone starts listening, so
+        # wait for the Activity's state rather than treating connect() as readiness.
+        while time.monotonic() < deadline:
+            state = adb("shell", "run-as", PACKAGE, "cat", "files/status.txt", check=False).stdout
+            if state.startswith("STREAMING"):
+                sock = socket.create_connection(("127.0.0.1", 8765), timeout=8)
+                break
+            if "from background" in state:
+                raise RuntimeError("폰 화면이 꺼져 있거나 잠겨 있어 앱이 카메라를 열지 못했다. 폰 화면을 켜고 잠금을 푼 뒤 다시 실행할 것 "
+                                   "(USB 연결 중 화면 유지: adb shell settings put global stay_on_while_plugged_in 2)\n" + state)
+            if any(s in state for s in ("FAILED", "ERROR", "DISCONNECTED", "STOPPED")):
+                raise RuntimeError(state)
+            time.sleep(.15)
+        if sock is None:
+            raise TimeoutError("Camera startup: " + state)
+        rcv = PhoneReceiver(sock, len(a.physical), a.size, a.max_skew_ms)
+        rcv.start()
+        return rcv
+
+    receiver = open_stream()
     started = time.monotonic()
+    stream_t0, restarts = started, 0           # 재시작 직후 10초는 '프레임 끊김' 판정을 유예한다
     last_print = started
     worker = ThreadPoolExecutor(max_workers=1)
     future = None
@@ -232,11 +238,31 @@ def main(a):
     try:
         while not a.duration or time.monotonic() - started < a.duration:
             frames, pair, pair_count, received = receiver.snapshot()
-            if receiver.error:
-                raise RuntimeError(receiver.error)
             now = time.monotonic()
-            if now - started > 10 and any(t is None or now-t > 8 for t in received):
-                raise TimeoutError("One or more physical streams stopped")
+            why = receiver.error or ("One or more physical streams stopped"
+                                     if now - stream_t0 > 10 and any(t is None or now-t > 8 for t in received) else None)
+            if why:
+                # 폰 화면 꺼짐·USB 순간 끊김·앱 중단: 앱을 다시 켜고 재접속한다 (--no-auto-restart 면 예전처럼 종료)
+                if not a.auto_restart:
+                    raise (RuntimeError(why) if receiver.error else TimeoutError(why))
+                receiver.close()
+                last_err = why
+                while True:
+                    if restarts >= a.max_restarts:
+                        raise RuntimeError(f"스트림 끊김 후 자동 재시작 {restarts}/{a.max_restarts}회로도 복구 실패: {last_err}")
+                    restarts += 1
+                    print(f"[restart {restarts}/{a.max_restarts}] 스트림 끊김: {last_err} -> 폰 앱 재시작", flush=True)
+                    time.sleep(min(2.0 * restarts, 8.0))
+                    try:
+                        start_phone(a)
+                        receiver = open_stream()
+                        break
+                    except (RuntimeError, TimeoutError, OSError, subprocess.SubprocessError) as e:
+                        last_err = str(e).splitlines()[0] if str(e) else type(e).__name__
+                stream_t0 = time.monotonic()
+                if depth_worker is not None:                 # 재시작 뒤 두 렌즈 노출 차가 달라질 수 있다: 다시 추정
+                    depth_worker.lens_dt_ms = None
+                continue
             if future and future.done():
                 result, report = future.result()
                 inference_times.append(report["ms"])
@@ -379,7 +405,7 @@ def main(a):
         stats = receiver.stats()
         stats.update(logical=a.logical, physical=a.physical, image_size=a.size,
                      elapsed_s=time.monotonic()-started, inference=report, inference_error=inference_error,
-                     inference_count=len(inference_times),
+                     inference_count=len(inference_times), auto_restarts=restarts,
                      inference_median_ms=float(np.median(inference_times)) if inference_times else None)
         (out / "summary.json").write_text(json.dumps(stats, indent=2))
         print(json.dumps(stats, indent=2), flush=True)
@@ -392,6 +418,8 @@ if __name__ == "__main__":
     os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--no-blobs", dest="blobs", action="store_false", help="깊이 기반 클래스 무관 검출(큐브 등) 끄기")
+    ap.add_argument("--no-auto-restart", dest="auto_restart", action="store_false", help="스트림이 끊기면 재시작하지 않고 종료")
+    ap.add_argument("--max-restarts", type=int, default=5, help="자동 재시작 최대 횟수 (기본 5)")
     ap.add_argument("--rgbd-viewer", action="store_true", help="RGB / depth / interactive scene point cloud / IMU dashboard")
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--list", action="store_true")

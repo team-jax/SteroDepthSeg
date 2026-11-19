@@ -16,4 +16,4 @@ L=cv2.imread('phone_stereo/runs/scene/captures/197065004375667/camera_2.png');R=
 m=lib_ffs.load(valid_iters=4)
 for i in range(5):
     t=time.perf_counter();lib_ffs.infer(m,L,R,valid_iters=4);torch.cuda.synchronize();print('ffs %.0f ms'%((time.perf_counter()-t)*1000))
-" 2>&1 | grep -E "^20|ffs"
+" 2>&1 | grep -E "^20|ffs"  
