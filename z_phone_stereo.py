@@ -35,6 +35,31 @@ def adb(*args, check=True):
     return subprocess.run([str(ADB), *map(str, args)], check=check, capture_output=True, text=True, timeout=30)
 
 
+STAY_ON_KEY = ("global", "stay_on_while_plugged_in")
+
+
+def keep_awake(a):
+    """USB 로 꽂혀 있는 동안 폰 화면이 꺼지지 않게 한다 (비트 2 = USB). 끝나면 원래 값으로 되돌린다 (restore_awake).
+
+    화면이 꺼져 Dozing 이 되면 카메라 앱이 백그라운드로 가서 프레임이 끊긴다 — 실측: 자동 재시작이 30~60초마다 5번 모두 실패.
+    """
+    if not getattr(a, "keep_awake", True):
+        return
+    cur = adb("shell", "settings", "get", *STAY_ON_KEY, check=False).stdout.strip()
+    prev = int(cur) if cur.lstrip("-").isdigit() else 0
+    a.stay_on_prev = prev
+    if not prev & 2:
+        adb("shell", "settings", "put", *STAY_ON_KEY, prev | 2, check=False)
+        print(f"[keep-awake] 폰 stay_on_while_plugged_in {prev} -> {prev | 2} (종료 시 {prev} 로 복원)", flush=True)
+
+
+def restore_awake(a):
+    prev = getattr(a, "stay_on_prev", None)
+    if prev is not None and not prev & 2:
+        adb("shell", "settings", "put", *STAY_ON_KEY, prev, check=False)
+    a.stay_on_prev = None
+
+
 def start_phone(a):
     # 화면이 꺼져 있거나 잠겨 있으면 앱이 화면 뒤에서 시작돼 Android 가 카메라를 막는다 ("cannot open camera from background")
     adb("shell", "input", "keyevent", "KEYCODE_WAKEUP", check=False)
@@ -158,6 +183,7 @@ def main(a):
     out.mkdir(parents=True, exist_ok=True)
     if not a.attach:
         a.phone_started = True
+        keep_awake(a)
         start_phone(a)
     else:
         a.phone_started = True
@@ -241,6 +267,8 @@ def main(a):
             now = time.monotonic()
             why = receiver.error or ("One or more physical streams stopped"
                                      if now - stream_t0 > 10 and any(t is None or now-t > 8 for t in received) else None)
+            if restarts and now - stream_t0 > 60 and not why:
+                restarts = 0                                 # 60초 넘게 정상이면 한도 카운트를 되돌린다 (긴 실행에서 드문 끊김이 쌓여 죽지 않게)
             if why:
                 # 폰 화면 꺼짐·USB 순간 끊김·앱 중단: 앱을 다시 켜고 재접속한다 (--no-auto-restart 면 예전처럼 종료)
                 if not a.auto_restart:
@@ -418,6 +446,7 @@ if __name__ == "__main__":
     os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--no-blobs", dest="blobs", action="store_false", help="깊이 기반 클래스 무관 검출(큐브 등) 끄기")
+    ap.add_argument("--no-keep-awake", dest="keep_awake", action="store_false", help="USB 연결 중 폰 화면 유지 설정을 건드리지 않는다")
     ap.add_argument("--no-auto-restart", dest="auto_restart", action="store_false", help="스트림이 끊기면 재시작하지 않고 종료")
     ap.add_argument("--max-restarts", type=int, default=5, help="자동 재시작 최대 횟수 (기본 5)")
     ap.add_argument("--rgbd-viewer", action="store_true", help="RGB / depth / interactive scene point cloud / IMU dashboard")
@@ -459,3 +488,4 @@ if __name__ == "__main__":
         if getattr(args, "phone_started", False):
             adb("shell", "am", "force-stop", PACKAGE, check=False)
             adb("forward", "--remove", "tcp:8765", check=False)
+        restore_awake(args)

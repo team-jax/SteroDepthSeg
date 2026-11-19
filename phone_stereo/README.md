@@ -138,7 +138,10 @@ done
 두 렌즈 중 하나라도 8초 넘게 프레임이 안 오거나(폰 화면 꺼짐, USB 순간 끊김, 앱 중단) 수신 오류가 나면,
 `z_phone_stereo.py` 는 종료하지 않고 `[restart n/5]` 를 찍은 뒤 폰 앱을 다시 켜서 재접속한다 (대기 2·4·6… 초, 최대 8초).
 
-- `--max-restarts N` (기본 5), `--no-auto-restart` (예전처럼 바로 종료).
+- `--max-restarts N` (기본 5), `--no-auto-restart` (예전처럼 바로 종료). 60초 넘게 정상이면 재시작 횟수는 0 으로 돌아간다.
+- **끊김의 실제 원인은 폰 화면 꺼짐(Dozing)이었다** (실측: 223초 동안 재시작 5번이 모두 같은 사유로 소진, 이때 폰은 `mWakefulness=Dozing`, 온도 정상).
+  그래서 기본으로 `settings put global stay_on_while_plugged_in` 의 USB 비트를 켜서 꽂혀 있는 동안 화면이 안 꺼지게 하고, 종료 시 원래 값으로 되돌린다
+  (`--no-keep-awake` 로 끔).
 - 재시작 뒤 두 렌즈 노출 차(`lens_offset_ms`)는 다시 추정한다. 정류 판정은 유지한다.
 - 최대 횟수까지 실패하면 마지막 사유와 함께 종료한다. `summary.json` 의 `auto_restarts` 에 횟수가 남는다.
 - 한계: 복구에는 USB 가 연결돼 있고 폰이 잠금 해제 상태여야 한다 (PIN/패턴 잠금은 못 푼다). 재시작 구간의 프레임은 없다.
