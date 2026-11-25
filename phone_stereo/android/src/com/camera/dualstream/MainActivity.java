@@ -1,6 +1,8 @@
 package com.camera.dualstream;
 
 import android.app.Activity;
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.os.*;
 import android.graphics.ImageFormat;
 import android.hardware.Sensor;
@@ -45,6 +47,11 @@ public class MainActivity extends Activity {
     private long[] counts;
     private int width, height;
     private boolean rawTimestamps;      // intent extra raw_ts=true: send logical timestamps (old behaviour)
+    // Wi-Fi (핫스팟·Tailscale): intent extra wifi=true 면 8765 를 모든 네트워크에서 받는다 (기본은 127.0.0.1 = adb forward 전용).
+    // send_fps>0 이면 캡처 한 쌍(같은 logical timestamp 의 렌즈들)을 1/send_fps 초마다 하나만 보낸다 — 무선 대역폭용 (NV21 그대로).
+    private boolean wifi;
+    private float sendFps;
+    private long gateLogical=Long.MIN_VALUE, nextSendNs=0;   // camera handler 스레드만 씀
     private static final int MAGIC_FRAME = 0x53544552, MAGIC_SENSOR = 0x53454E53;   // "STER", "SENS"
 
     /** Sensor event timestamps and camera timestamps (SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME on this device) are both
@@ -118,7 +125,9 @@ public class MainActivity extends Activity {
 
     private void status(String s) {
         Log.i(TAG, s);
-        runOnUiThread(() -> text.setText("Phone Stereo\n\n" + s + "\n\nUSB → PC\n화면을 켜둔 상태에서 사용합니다."));
+        final String link = wifi ? "Wi-Fi → PC  (포트 8765" + (sendFps > 0 ? ", " + sendFps + " 쌍/초" : "") + ")\n이 폰 주소: " + addresses()
+                                 : "USB → PC";
+        runOnUiThread(() -> text.setText("Phone Stereo\n\n" + s + "\n\n" + link + "\n화면을 켜둔 상태에서 사용합니다."));
         try (FileOutputStream f = openFileOutput("status.txt", MODE_PRIVATE)) {
             f.write(s.getBytes("UTF-8"));
         } catch (IOException e) { Log.e(TAG,"status write",e); }
@@ -134,6 +143,7 @@ public class MainActivity extends Activity {
         manager = (CameraManager)getSystemService(CAMERA_SERVICE);
         cameraThread = new HandlerThread("camera"); cameraThread.start();
         handler = new Handler(cameraThread.getLooper());
+        restoreLastSettings();
         try {
             JSONArray inventory = inventory();
             try (FileOutputStream f=openFileOutput("cameras.json",MODE_PRIVATE)) {
@@ -150,8 +160,10 @@ public class MainActivity extends Activity {
             for(String id:ids) if(!available.contains(id)) throw new IllegalArgumentException("Not in logical group: "+id);
             width=getIntent().getIntExtra("width",640); height=getIntent().getIntExtra("height",480);
             rawTimestamps=getIntent().getBooleanExtra("raw_ts",false);
+            wifi=getIntent().getBooleanExtra("wifi",false);
+            sendFps=getIntent().getFloatExtra("send_fps",0f);
             running=true;
-            server=new ServerSocket(8765,1,InetAddress.getByName("127.0.0.1"));
+            server=wifi ? new ServerSocket(8765,1) : new ServerSocket(8765,1,InetAddress.getByName("127.0.0.1"));
             new Thread(this::serve,"usb-writer").start();
             status("OPEN logical="+logical+" physical="+physical+" "+width+"x"+height);
             manager.openCamera(logical,new CameraDevice.StateCallback() {
@@ -254,6 +266,8 @@ public class MainActivity extends Activity {
             if(counts[index]==1 || counts[index]%150==0)
                 Log.i(TAG,"FRAME physical="+ids[index]+" count="+counts[index]+" ts="+image.getTimestamp());
             if(client==null) return;
+            // 보낼 차례가 아니면(다음 보낼 때까지 0.15 초 넘게 남음) NV21 변환도 건너뛴다 — 무선·배터리 때 폰 열 줄이기
+            if(sendFps>0 && SystemClock.elapsedRealtimeNanos()<nextSendNs-150_000_000L) return;
             byte[] nv21=new byte[width*height*3/2];
             Image.Plane[] planes=image.getPlanes();
             // Plane buffers can have row padding and interleaved UV; never assume contiguous.
@@ -266,13 +280,18 @@ public class MainActivity extends Activity {
                     nv21[dst]=b.get(base+y*row+x*pixel);
                 }
             }
-            if(rawTimestamps) enqueueFrame(index,image.getTimestamp(),nv21);
+            if(rawTimestamps) enqueueFrame(index,image.getTimestamp(),image.getTimestamp(),nv21);
             else timestampMatcher.image(index,image.getTimestamp(),nv21,SystemClock.elapsedRealtimeNanos());
         } catch(Exception e) { Log.e(TAG,"frame",e); }
     }
 
-    private void enqueueFrame(int index,long timestamp,byte[] data) {
+    private void enqueueFrame(int index,long logical,long timestamp,byte[] data) {
         if(!running || client==null) return;
+        if(sendFps>0 && logical!=gateLogical) {      // 새 캡처: 보낼 차례면 이 캡처의 렌즈들을 모두 통과, 아니면 버림
+            long now=SystemClock.elapsedRealtimeNanos();
+            if(now<nextSendNs) return;
+            gateLogical=logical; nextSendNs=now+(long)(1e9/sendFps);
+        }
         Packet packet=new Packet(index,timestamp,data);
         if(!pending.offer(packet)) { pending.poll(); pending.offer(packet); }
     }
@@ -298,9 +317,41 @@ public class MainActivity extends Activity {
                     }
                     if(p!=null || n>0) out.flush();
                 }
-            } catch(Exception e) { if(running) Log.i(TAG,"USB client: "+e); }
+            } catch(Exception e) { if(running) Log.i(TAG,(wifi?"Wi-Fi":"USB")+" client: "+e); }
             finally { client=null; }
         }
+    }
+
+    /** PC 가 카메라를 고르고 띄운 마지막 설정을 기억한다. 폰에서 아이콘으로 열면(extra 없음) 그 설정으로 — 케이블 없이 Wi-Fi 로 쓸 때. */
+    private void restoreLastSettings() {
+        SharedPreferences sp=getSharedPreferences("last",MODE_PRIVATE);
+        Intent in=getIntent();
+        if(in.getStringExtra("logical")!=null && in.getStringExtra("physical")!=null) {
+            sp.edit().putString("logical",in.getStringExtra("logical")).putString("physical",in.getStringExtra("physical"))
+              .putInt("width",in.getIntExtra("width",640)).putInt("height",in.getIntExtra("height",480)).putInt("fps",in.getIntExtra("fps",15))
+              .putFloat("focus_diopters",in.getFloatExtra("focus_diopters",1.0f)).putBoolean("raw_ts",in.getBooleanExtra("raw_ts",false))
+              .putBoolean("wifi",in.getBooleanExtra("wifi",false)).putFloat("send_fps",in.getFloatExtra("send_fps",0f)).apply();
+        } else if(sp.contains("logical")) {
+            Intent n=new Intent(in);
+            n.putExtra("logical",sp.getString("logical","0")).putExtra("physical",sp.getString("physical",""))
+             .putExtra("width",sp.getInt("width",640)).putExtra("height",sp.getInt("height",480)).putExtra("fps",sp.getInt("fps",15))
+             .putExtra("focus_diopters",sp.getFloat("focus_diopters",1.0f)).putExtra("raw_ts",sp.getBoolean("raw_ts",false))
+             .putExtra("wifi",sp.getBoolean("wifi",false)).putExtra("send_fps",sp.getFloat("send_fps",0f));
+            setIntent(n);
+        }
+    }
+
+    /** 화면에 보일 이 폰의 IPv4 주소들 (핫스팟·Wi-Fi·Tailscale) — PC 에 넣을 주소. */
+    private static String addresses() {
+        StringBuilder sb=new StringBuilder();
+        try {
+            for(NetworkInterface ni:Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if(!ni.isUp() || ni.isLoopback()) continue;
+                for(InetAddress a:Collections.list(ni.getInetAddresses()))
+                    if(a instanceof Inet4Address) sb.append(sb.length()>0?", ":"").append(a.getHostAddress()).append(" (").append(ni.getName()).append(")");
+            }
+        } catch(Exception e) { return "?"; }
+        return sb.length()>0?sb.toString():"없음 (와이파이·핫스팟 확인)";
     }
 
     // Transient focus changes can pause a visible activity during camera startup.

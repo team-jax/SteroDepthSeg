@@ -3,8 +3,10 @@
 Camera-specific calibration is mandatory. Laptop/phone calibration must never be
 silently reused for two phone lenses. This module does not fabricate calibration.
 """
+from contextlib import contextmanager
 import json
 from pathlib import Path
+import threading
 import time
 
 import cv2
@@ -59,7 +61,48 @@ def gravity_frame(st, imu):
                 frame="x=camera right (horizontal), y=forward (horizontal), z=up; origin=left lens")
 
 
-def depth_colormap(depth, valid, zmin=0.3, zmax=3.0):
+_ORIG_PUTTEXT = cv2.putText
+_TL = threading.local()
+
+
+def _put_text_hook(img, text, org, fontFace, fontScale, color, thickness=1, lineType=cv2.LINE_8, bottomLeftOrigin=False):
+    """text_rot180 안(이 스레드)이면 그리지 않고 모은다. 밖이면 원래 cv2.putText."""
+    rec = getattr(_TL, "rec", None)
+    if rec is None or bottomLeftOrigin:
+        return _ORIG_PUTTEXT(img, text, org, fontFace, fontScale, color, thickness, lineType, bottomLeftOrigin)
+    rec.setdefault(id(img), (img, []))[1].append((str(text), (int(org[0]), int(org[1])), fontFace, fontScale, color, int(thickness), lineType))
+    return img
+
+
+def _draw_rot180(img, calls):
+    """글자들을 '그림을 180° 돌렸을 때 바로 읽히게' 그린다: 돌린 그림에 같은 글자 상자 자리로 바로 쓰고 다시 돌린다."""
+    H, W = img.shape[:2]
+    r = np.ascontiguousarray(img[::-1, ::-1])
+    for text, (x, y), font, scale, color, thick, line in calls:
+        (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
+        _ORIG_PUTTEXT(r, text, (W - 1 - x - tw, H - 1 - y - bl + th), font, scale, color, thick, line)
+    img[:] = r[::-1, ::-1]
+
+
+@contextmanager
+def text_rot180(on):
+    """on 이면 이 안에서 쓴 cv2.putText 글자를 나갈 때 그림마다 180° 돌려 쓴다 (그림·선·마스크는 그대로).
+    폰이 거치대에 거꾸로 끼워져 대시보드가 이 그림을 칸마다 180° 돌려 보여 준다 — 그때 글자가 바로 읽히게 (--text-rot180).
+    hstack 처럼 그림을 복사하기 전에 나와야 한다 (복사본엔 글자가 안 들어간다)."""
+    if not on:
+        yield
+        return
+    cv2.putText = _put_text_hook        # 다른 스레드·이 블록 밖에서는 그대로 지나간다
+    prev, _TL.rec = getattr(_TL, "rec", None), {}
+    try:
+        yield
+    finally:
+        rec, _TL.rec = _TL.rec, prev
+        for img, calls in rec.values():
+            _draw_rot180(img, calls)
+
+
+def depth_colormap(depth, valid, zmin=0.3, zmax=3.0, rot_text=False):
     """깊이맵 → 색: 가까움=빨강, 멂=파랑 (JET 역방향), 로그 스케일(스테레오 정밀도가 Z² 로 나빠지므로). 무효=검정. 오른쪽에 눈금 막대."""
     z = np.where(valid, depth, np.nan).astype(np.float32)
     t = (np.log(np.clip(z, zmin, zmax)) - np.log(zmin)) / (np.log(zmax) - np.log(zmin))     # 0=가까움 .. 1=멂
@@ -69,12 +112,12 @@ def depth_colormap(depth, valid, zmin=0.3, zmax=3.0):
     H, W = img.shape[:2]
     bar = cv2.applyColorMap(np.linspace(255, 0, H - 40, dtype=np.uint8).reshape(-1, 1).repeat(22, 1), cv2.COLORMAP_JET)  # 위 빨강(가까움)
     panel = np.zeros((H, 70, 3), np.uint8); panel[20:H - 20, 6:28] = bar
-    for frac, label in ((0.0, f"{zmin:g}m"), (0.5, f"{np.sqrt(zmin * zmax):.2g}m"), (1.0, f"{zmax:g}m")):
-        y = int(20 + frac * (H - 41))
-        cv2.putText(panel, label, (31, y + 5), cv2.FONT_HERSHEY_SIMPLEX, .42, (255, 255, 255), 1)
-    out = np.hstack([img, panel])
-    cv2.putText(out, "depth  red=near  blue=far", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 2)
-    return out
+    with text_rot180(rot_text):          # 눈금 칸·그림 칸을 따로 (대시보드가 칸마다 돌린다)
+        for frac, label in ((0.0, f"{zmin:g}m"), (0.5, f"{np.sqrt(zmin * zmax):.2g}m"), (1.0, f"{zmax:g}m")):
+            y = int(20 + frac * (H - 41))
+            cv2.putText(panel, label, (31, y + 5), cv2.FONT_HERSHEY_SIMPLEX, .42, (255, 255, 255), 1)
+        cv2.putText(img, "depth  red=near  blue=far", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 2)
+    return np.hstack([img, panel])
 
 
 def rotation_between(st, win, tL, tR):
@@ -318,12 +361,14 @@ class PhoneDepth:
                     rec["center_world_m"] = None; rec["height_rel_camera_m"] = None
                 rows.append(rec)
             results[method] = rows
-            vis = od.draw_overlay(left, dets, rows, method)
-            cv2.putText(vis, f"{method} depth - {self.st.get('scale_status', 'unverified')}", (12,24),
-                        cv2.FONT_HERSHEY_SIMPLEX, .6, (0,220,255), 2)
+            rot = bool(getattr(a, "text_rot180", False))
+            with text_rot180(rot):
+                vis = od.draw_overlay(left, dets, rows, method)
+                cv2.putText(vis, f"{method} depth - {self.st.get('scale_status', 'unverified')}", (12,24),
+                            cv2.FONT_HERSHEY_SIMPLEX, .6, (0,220,255), 2)
             overlays.append(vis)
         zr = getattr(a, "depth_range", None) or (0.3, 3.0)
-        overlays.append(depth_colormap(depth, valid, float(zr[0]), float(zr[1])))
+        overlays.append(depth_colormap(depth, valid, float(zr[0]), float(zr[1]), rot_text=bool(getattr(a, "text_rot180", False))))
         report = dict(timestamp_ns=[fL.timestamp_ns, fR.timestamp_ns], physical_lr=self.st["phone"]["physical"],
                       exposure_skew_ms=(fR.timestamp_ns - fL.timestamp_ns) / 1e6, gyro_skew_compensation_deg=round(skew_deg, 4), motion_px=motion_px(imu, rp["f"], extra_ms),
                       lens_timing=("unknown" if unknown_timing else "reported"),

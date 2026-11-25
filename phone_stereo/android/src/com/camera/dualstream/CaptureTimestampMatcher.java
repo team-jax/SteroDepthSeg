@@ -8,7 +8,7 @@ import java.util.Map;
  * Payloads are copies, never open Images. Expiry uses callback arrival time, not sensor time.
  */
 final class CaptureTimestampMatcher {
-    interface Sink { void accept(int index, long physicalTimestamp, byte[] data); }
+    interface Sink { void accept(int index, long logical, long physicalTimestamp, byte[] data); }   // logical = 같은 캡처의 렌즈들이 공유하는 키
     private static final int LIMIT = 24;
     private static final long TTL_NS = 1_000_000_000L;
     private final int count;
@@ -17,6 +17,7 @@ final class CaptureTimestampMatcher {
     long matched, dropped;
     private final class Entry {
         final long arrival;
+        long logical;
         final byte[][] images = new byte[count][];
         final boolean[] consumed = new boolean[count];
         Long[] physical;
@@ -35,7 +36,7 @@ final class CaptureTimestampMatcher {
                 it = entries.entrySet().iterator();
                 discard(it.next().getValue()); it.remove();
             }
-            e = new Entry(now); entries.put(timestamp, e);
+            e = new Entry(now); e.logical = timestamp; entries.put(timestamp, e);
         }
         return e;
     }
@@ -57,7 +58,7 @@ final class CaptureTimestampMatcher {
         byte[] data = e.images[i]; e.images[i] = null; e.consumed[i] = true;
         if (e.physical[i] == null) { dropped++; return; }
         matched++;
-        sink.accept(i, e.physical[i], data);
+        sink.accept(i, e.logical, e.physical[i], data);
     }
     private void discard(Entry e) {
         for (byte[] data : e.images) if (data != null) dropped++;

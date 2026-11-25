@@ -4,8 +4,9 @@ public class CaptureTimestampMatcherTest {
     static void check(boolean ok) { if(!ok) throw new AssertionError(); }
     public static void main(String[] args) {
         List<String> out=new ArrayList<>();
+        List<Long> logicals=new ArrayList<>();     // Sink 의 logical = 같은 캡처 렌즈들이 공유하는 키 (Wi-Fi 쌍 단위 거르기용)
         CaptureTimestampMatcher m=new CaptureTimestampMatcher(2,
-            (i,t,b) -> out.add(i+":"+t+":"+b[0]));
+            (i,l,t,b) -> { out.add(i+":"+t+":"+b[0]); logicals.add(l); });
         // Image before result; another result arrives first with a very different offset.
         m.image(0,100,new byte[]{1},0);
         m.result(200,new Long[]{120L,200L},1);
@@ -17,6 +18,7 @@ public class CaptureTimestampMatcherTest {
         m.image(0,200,new byte[]{2},4);
         m.image(1,100,new byte[]{3},5);
         check(out.equals(Arrays.asList("0:30:1","0:120:2","1:100:3")));
+        check(logicals.equals(Arrays.asList(100L,200L,100L)));     // 렌즈 1 의 100 은 첫 캡처(logical 100) 것
         // Missing physical metadata must never inherit the previous offset.
         m.result(300,new Long[]{null,300L},6);
         m.image(0,300,new byte[]{4},7);

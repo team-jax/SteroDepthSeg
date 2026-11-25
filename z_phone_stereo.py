@@ -60,6 +60,15 @@ def restore_awake(a):
     a.stay_on_prev = None
 
 
+def adb_ready():
+    """adb 로 폰 하나가 보이나 (USB 또는 adb connect 한 무선). 여러 대면 ANDROID_SERIAL 로 고른다."""
+    try:
+        r = adb("get-state", check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "device"
+
+
 def start_phone(a):
     # 화면이 꺼져 있거나 잠겨 있으면 앱이 화면 뒤에서 시작돼 Android 가 카메라를 막는다 ("cannot open camera from background")
     adb("shell", "input", "keyevent", "KEYCODE_WAKEUP", check=False)
@@ -72,6 +81,8 @@ def start_phone(a):
                  "--ei", "width", a.size[0], "--ei", "height", a.size[1], "--ei", "fps", a.fps,
                  "--ef", "focus_diopters", (1.0 / a.focus_m) if a.focus_m > 0 else 0.0,
                  "--ez", "raw_ts", "true" if a.raw_ts else "false"]
+        if a.wifi:   # 앱이 8765 를 모든 네트워크에서 받고, 1/send_fps 초마다 한 쌍만 보낸다 (앱이 이 설정을 기억 → 다음엔 폰에서 아이콘만 눌러도 됨)
+            args += ["--ez", "wifi", "true", "--ef", "send_fps", float(a.send_fps)]
     print(adb(*args).stdout.strip(), flush=True)
 
 
@@ -181,12 +192,18 @@ def main(a):
         print(adb("install", "-r", "-g", ROOT / "phone_stereo/android/build/phone-stereo.apk").stdout)
     out = Path(a.out or ROOT / "phone_stereo/runs" / datetime.now().strftime("%Y%m%d-%H%M%S"))
     out.mkdir(parents=True, exist_ok=True)
-    if not a.attach:
+    # Wi-Fi (핫스팟·Tailscale): 영상은 폰 IP:8765 로 바로 받는다. adb(USB·무선)가 보이면 앱 켜기·상태 확인에만 쓰고,
+    # 안 보이면 폰에서 Phone Stereo 앱을 직접 연다 (앱이 마지막 설정을 기억 — 한 번은 adb 로 --wifi 를 켜 둬야 한다)
+    a.use_adb = (not a.wifi) or adb_ready()
+    if a.wifi:
+        print(f"[wifi] 폰 {a.wifi}:8765 에서 받기 · {a.send_fps:g} 쌍/초 · "
+              + ("adb 로 앱 켜기" if a.use_adb else "adb 없음 — 폰에서 Phone Stereo 앱을 직접 열 것"), flush=True)
+    if not a.attach and a.use_adb:
         a.phone_started = True
         keep_awake(a)
         start_phone(a)
     else:
-        a.phone_started = True
+        a.phone_started = a.use_adb
     if a.list:
         # Inventory is written asynchronously by Activity.onCreate.
         deadline = time.monotonic() + 10
@@ -206,15 +223,26 @@ def main(a):
         raise TimeoutError("Phone inventory failed")
     def open_stream():
         """adb forward -> 앱이 STREAMING 이 될 때까지 대기 -> 접속 -> 수신 스레드 시작. 처음 연결과 자동 재시작이 같이 쓴다."""
-        adb("forward", "tcp:8765", "tcp:8765")
-        deadline = time.monotonic() + 12
-        sock = None
+        host = a.wifi or "127.0.0.1"
+        if not a.wifi:
+            adb("forward", "tcp:8765", "tcp:8765")
+        deadline = time.monotonic() + (12 if a.use_adb else 30)
+        sock, state = None, ""
         # ADB's forwarded port accepts even before the phone starts listening, so
         # wait for the Activity's state rather than treating connect() as readiness.
         while time.monotonic() < deadline:
+            if not a.use_adb:   # Wi-Fi + adb 없음: 앱 상태를 못 보니 접속될 때까지 다시 시도
+                try:
+                    sock = socket.create_connection((host, 8765), timeout=3)
+                    sock.settimeout(max(8.0, 4.0 / max(a.send_fps, 0.1)))
+                    break
+                except OSError as e:
+                    state = f"{host}:8765 에 연결 안 됨 ({e}) — 폰에서 Phone Stereo 앱이 열려 있나, PC 와 같은 핫스팟·Tailscale 인가"
+                    time.sleep(1.0)
+                    continue
             state = adb("shell", "run-as", PACKAGE, "cat", "files/status.txt", check=False).stdout
             if state.startswith("STREAMING"):
-                sock = socket.create_connection(("127.0.0.1", 8765), timeout=8)
+                sock = socket.create_connection((host, 8765), timeout=8)
                 break
             if "from background" in state:
                 raise RuntimeError("폰 화면이 꺼져 있거나 잠겨 있어 앱이 카메라를 열지 못했다. 폰 화면을 켜고 잠금을 푼 뒤 다시 실행할 것 "
@@ -259,7 +287,7 @@ def main(a):
         cv2.setWindowProperty("board", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     def small(f):
         return cv2.resize(cv2.cvtColor(f.bgr, cv2.COLOR_BGR2GRAY), (160, 120), interpolation=cv2.INTER_AREA).astype(np.float32)
-    title = "Phone Stereo - USB to PC (Q: quit, S: paired PNG)"
+    title = f"Phone Stereo - {'Wi-Fi' if a.wifi else 'USB'} to PC (Q: quit, S: paired PNG)"
     print(f"Receiving {a.physical}; saving to {out}", flush=True)
     try:
         while not a.duration or time.monotonic() - started < a.duration:
@@ -282,7 +310,8 @@ def main(a):
                     print(f"[restart {restarts}/{a.max_restarts}] 스트림 끊김: {last_err} -> 폰 앱 재시작", flush=True)
                     time.sleep(min(2.0 * restarts, 8.0))
                     try:
-                        start_phone(a)
+                        if a.use_adb:
+                            start_phone(a)
                         receiver = open_stream()
                         break
                     except (RuntimeError, TimeoutError, OSError, subprocess.SubprocessError) as e:
@@ -453,6 +482,9 @@ if __name__ == "__main__":
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--attach", action="store_true", help="Receive from an already started Phone Stereo app")
+    ap.add_argument("--wifi", metavar="PHONE_IP", help="USB 대신 Wi-Fi(핫스팟·Tailscale)로: 폰 IP 의 8765 에서 바로 받는다. adb 가 보이면 앱 켜기에만 쓴다")
+    ap.add_argument("--send-fps", type=float, default=None, help="앱이 1 초에 보낼 쌍 수 (기본: --wifi 면 1, 아니면 전부)")
+    ap.add_argument("--text-rot180", action="store_true", help="결과 그림의 글자를 180° 돌려 쓴다 (그림을 뒤집어 보는 대시보드에서 바로 읽히게)")
     ap.add_argument("--logical", default="0")
     ap.add_argument("--physical", nargs="+", default=["5", "2"])
     ap.add_argument("--size", type=int, nargs=2, default=[640, 480])
@@ -480,6 +512,8 @@ if __name__ == "__main__":
     ap.add_argument("--board-hud", action="store_true", help="체커보드 검출 표시(BOARD OK/NO BOARD, 코너) + 양쪽 다 검출될 때만 저장")
     ap.add_argument("--show-board", metavar="PNG", help="이 PC 화면에 보드 PNG 를 1:1 전체화면으로 띄우고 저장 상태를 여백에 표시 (--board-hud 와 함께, 화면 해상도와 같은 크기의 PNG)")
     args = ap.parse_args()
+    if args.send_fps is None:
+        args.send_fps = 1.0 if args.wifi else 0.0
     try:
         main(args)
     except KeyboardInterrupt:
@@ -487,5 +521,6 @@ if __name__ == "__main__":
     finally:
         if getattr(args, "phone_started", False):
             adb("shell", "am", "force-stop", PACKAGE, check=False)
-            adb("forward", "--remove", "tcp:8765", check=False)
+            if not args.wifi:
+                adb("forward", "--remove", "tcp:8765", check=False)
         restore_awake(args)
