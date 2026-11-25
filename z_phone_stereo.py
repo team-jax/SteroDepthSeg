@@ -307,7 +307,7 @@ def main(a):
                     if restarts >= a.max_restarts:
                         raise RuntimeError(f"스트림 끊김 후 자동 재시작 {restarts}/{a.max_restarts}회로도 복구 실패: {last_err}")
                     restarts += 1
-                    print(f"[restart {restarts}/{a.max_restarts}] 스트림 끊김: {last_err} -> 폰 앱 재시작", flush=True)
+                    print(f"[restart {restarts}/{a.max_restarts}] 스트림 끊김: {last_err} -> " + ("폰 앱 재시작" if a.use_adb else "Wi-Fi 다시 연결 (폰 앱은 켜 둔 채)"), flush=True)
                     time.sleep(min(2.0 * restarts, 8.0))
                     try:
                         if a.use_adb:
